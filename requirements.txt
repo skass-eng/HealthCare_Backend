@@ -1,0 +1,30 @@
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+python-multipart==0.0.20
+python-decouple==3.8
+pydantic==2.11.7
+typing-extensions==4.14.1
+
+# Pour l'upload de fichiers
+aiofiles==24.1.0
+
+# Pour les variables d'environnement
+python-dotenv==1.0.1
+
+# Pour PostgreSQL
+psycopg2-binary==2.9.9
+asyncpg==0.29.0
+
+# Pour le traitement PDF (à ajouter plus tard)
+PyPDF2==3.0.1
+pdfplumber==0.11.4
+
+# Pour la base de données
+sqlalchemy==2.0.36
+alembic==1.14.0
+databases[postgresql]==0.9.0
+
+# Pour l'IA et le traitement de texte (à ajouter plus tard)
+openai==1.54.4
+langchain==0.3.9
+transformers==4.47.1 
