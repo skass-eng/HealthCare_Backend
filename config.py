@@ -11,7 +11,7 @@ class Settings:
     
     # Configuration du serveur
     HOST: str = "0.0.0.0"
-    PORT: int = 8000
+    PORT: int = 6000
     
     # Configuration CORS
     ALLOWED_ORIGINS: List[str] = ["*"]  # À restreindre en production

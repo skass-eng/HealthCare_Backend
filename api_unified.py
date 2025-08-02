@@ -1425,8 +1425,8 @@ async def get_pages_analytics(
     return result
 
 @app.get("/pages/analytics-v2")
-async def get_pages_analytics_v2(organisation_id: Optional[int] = Query(None)):
-    """Récupérer les analytics V2 via l'API Pages"""
+async def get_pages_administration(organisation_id: Optional[int] = Query(None)):
+    """Récupérer les données d'administration via l'API Pages"""
     params = {}
     if organisation_id:
         params["organisation_id"] = organisation_id
@@ -1464,7 +1464,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "api_unified:app",
         host="0.0.0.0",
-        port=8000,
+        port=6000,
         reload=True,
         log_level="info"
     ) 

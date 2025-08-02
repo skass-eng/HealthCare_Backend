@@ -30,7 +30,7 @@ def restart_server():
                         cwd=os.getcwd())
         
         print("✅ Serveur redémarré avec succès!")
-        print("🌐 API disponible sur: http://localhost:8000")
+        print("🌐 API disponible sur: http://localhost:6000")
         print("📊 Dashboard disponible sur: http://localhost:3000")
         print("\n💡 Testez maintenant l'export CSV - les caractères français devraient s'afficher correctement!")
         

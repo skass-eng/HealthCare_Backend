@@ -161,18 +161,18 @@ async def get_pages_analytics(
     }
 
 @app.get("/analytics-v2")
-async def get_pages_analytics_v2(organisation_id: Optional[int] = Query(None)):
-    """Page analytics v2"""
+async def get_pages_administration(organisation_id: Optional[int] = Query(None)):
+    """Page administration"""
     return {
         "page": "analytics-v2",
-        "title": "Analytics V2",
-        "description": "Version avancée des analytics",
+        "title": "Administration",
+        "description": "Gestion des organisations et services",
         "organisation_id": organisation_id,
-        "features": [
-            "predictions_ia",
-            "analyse_sentiment",
-            "detection_anomalies",
-            "optimisation_automatique"
+        "sections": [
+            "organisations",
+            "services",
+            "utilisateurs",
+            "configurations"
         ]
     }
 

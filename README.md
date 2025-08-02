@@ -63,13 +63,13 @@ Backend API pour l'application de gestion des plaintes de santé.
 
 2. **Ou utiliser uvicorn directement**
    ```bash
-   uvicorn main_app:app --reload --host 0.0.0.0 --port 8000
+   uvicorn main_app:app --reload --host 0.0.0.0 --port 6000
    ```
 
 3. **Accéder à l'API**
-   - API: http://localhost:8000
-   - Documentation Swagger: http://localhost:8000/docs
-   - Documentation ReDoc: http://localhost:8000/redoc
+   - API: http://localhost:6000
+- Documentation Swagger: http://localhost:6000/docs
+- Documentation ReDoc: http://localhost:6000/redoc
 
 ## 📁 Structure du projet
 
@@ -158,7 +158,7 @@ gunicorn main_app:app -w 4 -k uvicorn.workers.UvicornWorker
 docker build -t healthcare-backend .
 
 # Lancer le conteneur
-docker run -p 8000:8000 healthcare-backend
+docker run -p 6000:6000 healthcare-backend
 ```
 
 ## 🤝 Contribution

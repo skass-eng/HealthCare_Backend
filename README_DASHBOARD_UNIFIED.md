@@ -159,9 +159,9 @@ GET /api/v1/dashboard/plaintes/en-attente?type_service=ADMINISTRATION
 ## 📱 Interface Utilisateur
 
 ### Navigation Intuitive
-- **Page d'accueil** : http://localhost:8000
-- **Dashboard unifié** : http://localhost:8000/api/v1/dashboard/statistiques
-- **Filtres disponibles** : http://localhost:8000/api/v1/dashboard/filtres-disponibles
+- **Page d'accueil** : http://localhost:6000
+- **Dashboard unifié** : http://localhost:6000/api/v1/dashboard/statistiques
+- **Filtres disponibles** : http://localhost:6000/api/v1/dashboard/filtres-disponibles
 
 ### Fonctionnalités
 - **Filtres dynamiques** : Sélection en temps réel
@@ -223,9 +223,9 @@ python start_main_app.py
 ```
 
 ### Accès au Dashboard
-- **URL principale** : http://localhost:8000
-- **Documentation** : http://localhost:8000/docs
-- **Navigation** : http://localhost:8000/navigation
+- **URL principale** : http://localhost:6000
+- **Documentation** : http://localhost:6000/docs
+- **Navigation** : http://localhost:6000/navigation
 
 ## 🔄 Migration depuis l'Ancien Système
 

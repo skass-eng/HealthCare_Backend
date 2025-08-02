@@ -21,16 +21,16 @@ python start_main_app.py
 ### Option 3: Uvicorn Direct
 ```bash
 cd backend
-uvicorn main_app:app --host 0.0.0.0 --port 8000 --reload
+uvicorn main_app:app --host 0.0.0.0 --port 6000 --reload
 ```
 
 ## 📱 Accès à l'Application
 
-- **Page d'accueil**: http://localhost:8000
-- **Documentation Swagger**: http://localhost:8000/docs
-- **Documentation ReDoc**: http://localhost:8000/redoc
-- **Guide de navigation**: http://localhost:8000/navigation
-- **État du système**: http://localhost:8000/status
+- **Page d'accueil**: http://localhost:6000
+- **Documentation Swagger**: http://localhost:6000/docs
+- **Documentation ReDoc**: http://localhost:6000/redoc
+- **Guide de navigation**: http://localhost:6000/navigation
+- **État du système**: http://localhost:6000/status
 
 ## 📋 Organisation par Sections
 
@@ -70,7 +70,7 @@ uvicorn main_app:app --host 0.0.0.0 --port 8000 --reload
 **Endpoints**:
 - `GET /api/v2/pages/dashboard` - Dashboard principal
 - `GET /api/v2/pages/analytics` - Analytics avancées
-- `GET /api/v2/pages/analytics-v2` - Analytics V2
+- `GET /api/v2/pages/analytics-v2` - Administration
 - `GET /api/v2/pages/ameliorations` - Améliorations
 
 ### 5. 🔒 Audit et Sécurité
@@ -90,7 +90,7 @@ uvicorn main_app:app --host 0.0.0.0 --port 8000 --reload
 ## 🏗️ Architecture
 
 ```
-main_app.py (Port 8000)
+main_app.py (Port 6000)
 ├── /api/v1/* (API Unifiée)
 │   ├── /plaintes/*
 │   ├── /statistiques/*
@@ -131,7 +131,7 @@ DATABASE_URL=postgresql://user:password@localhost:5432/healthcare_ai
 
 # Configuration API
 API_HOST=0.0.0.0
-API_PORT=8000
+API_PORT=6000
 DEBUG=True
 ```
 
@@ -163,13 +163,13 @@ python start_main_app.py
 
 ### Production
 ```bash
-uvicorn main_app:app --host 0.0.0.0 --port 8000 --workers 4
+uvicorn main_app:app --host 0.0.0.0 --port 6000 --workers 4
 ```
 
 ### Docker (optionnel)
 ```bash
 docker build -t healthcare-ai-main .
-docker run -p 8000:8000 healthcare-ai-main
+docker run -p 6000:6000 healthcare-ai-main
 ```
 
 ## 🔄 Migration depuis l'Ancienne Architecture
@@ -209,7 +209,7 @@ docker run -p 8000:8000 healthcare-ai-main
 1. **Port déjà utilisé**
    ```bash
    # Vérifier les processus
-   netstat -ano | findstr :8000
+   netstat -ano | findstr :6000
    # Arrêter le processus
    taskkill /PID <PID> /F
    ```
@@ -235,8 +235,8 @@ python start_main_app.py
 ## 📞 Support
 
 Pour toute question ou problème :
-1. Consulter la documentation : http://localhost:8000/docs
-2. Vérifier l'état du système : http://localhost:8000/status
+1. Consulter la documentation : http://localhost:6000/docs
+2. Vérifier l'état du système : http://localhost:6000/status
 3. Consulter les logs de l'application
 
 ---

@@ -369,7 +369,7 @@ async def status_complet():
         "services": {
             "api_unified": {
                 "status": "online",
-                "port": 8000,
+                "port": 6000,
                 "endpoints": "/api/v1/*"
             },
             "api_pages": {
@@ -379,7 +379,7 @@ async def status_complet():
             },
             "api_dashboard_unified": {
                 "status": "online",
-                "port": 8000,
+                "port": 6000,
                 "endpoints": "/api/v1/dashboard/*"
             }
         },
@@ -490,7 +490,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "main_app:app",
         host="0.0.0.0",
-        port=8000,
+        port=5000,
         reload=True,
         log_level="info"
     ) 

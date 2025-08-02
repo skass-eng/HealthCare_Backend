@@ -87,14 +87,14 @@ python start_main_app.py
 
 # Option 3: Uvicorn
 cd backend
-uvicorn main_app:app --host 0.0.0.0 --port 8000 --reload
+uvicorn main_app:app --host 0.0.0.0 --port 6000 --reload
 ```
 
 ### Accès aux Services
-- **Page d'accueil** : http://localhost:8000
-- **Documentation** : http://localhost:8000/docs
-- **Navigation** : http://localhost:8000/navigation
-- **Statut** : http://localhost:8000/status
+- **Page d'accueil** : http://localhost:6000
+- **Documentation** : http://localhost:6000/docs
+- **Navigation** : http://localhost:6000/navigation
+- **Statut** : http://localhost:6000/status
 
 ## 📊 Statistiques du Nettoyage
 

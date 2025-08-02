@@ -169,17 +169,17 @@ class AnalyticsResponse(PageResponse):
     """Réponse pour la page Analytics"""
     data: Dict[str, Any]
 
-# ==================== PAGE ANALYTICS V2 ====================
+# ==================== PAGE ADMINISTRATION ====================
 
-class AnalyticsV2Data(BaseModel):
-    """Données pour la page Analytics V2"""
-    predictions_ia: Dict[str, Any]
-    insights_avances: List[Dict[str, Any]]
-    recommandations: List[str]
-    metriques_avancees: Dict[str, Any]
+class AdministrationData(BaseModel):
+    """Données pour la page Administration"""
+    organisations: List[Dict[str, Any]]
+    services: List[Dict[str, Any]]
+    utilisateurs: List[Dict[str, Any]]
+    configurations: Dict[str, Any]
 
-class AnalyticsV2Response(PageResponse):
-    """Réponse pour la page Analytics V2"""
+class AdministrationResponse(PageResponse):
+    """Réponse pour la page Administration"""
     data: Dict[str, Any]
 
 # ==================== PAGE PARAMÈTRES ====================
@@ -797,97 +797,137 @@ async def get_analytics_data(
         logger.error(f"Erreur dans get_analytics_data: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Erreur interne: {str(e)}")
 
-# ==================== PAGE ANALYTICS V2 ====================
+# ==================== PAGE ADMINISTRATION ====================
 
-@app.get("/analytics-v2", response_model=AnalyticsV2Response)
-async def get_analytics_v2_data(
+@app.get("/analytics-v2", response_model=AdministrationResponse)
+async def get_administration_data(
     organisation_id: Optional[int] = Query(None),
     db: Session = Depends(get_db)
 ):
-    """Récupérer les données pour la page Analytics V2"""
+    """Récupérer les données pour la page Administration"""
     try:
-        # Prédictions IA
-        predictions_ia = {
-            "plaintes_predites_7j": 45,
-            "plaintes_urgentes_predites": 8,
-            "taux_resolution_predit": 87.3,
-            "services_risque": ["Cardiologie", "Urgences"],
-            "tendance_satisfaction": "Amélioration"
-        }
-        
-        # Insights avancés
-        insights_avances = [
+        # Organisations
+        organisations = [
             {
-                "type": "tendance",
-                "titre": "Augmentation des plaintes cardiologie",
-                "description": "Hausse de 23% ce mois",
-                "impact": "Élevé",
-                "recommandation": "Renforcer l'équipe cardiologie"
+                "id": 1,
+                "nom": "Centre Hospitalier Universitaire",
+                "type": "CHU",
+                "adresse": "123 Avenue de la Santé",
+                "ville": "Paris",
+                "code_postal": "75001",
+                "telephone": "01 23 45 67 89",
+                "email": "contact@chu-paris.fr",
+                "statut": "Actif",
+                "nombre_services": 15,
+                "nombre_utilisateurs": 45
             },
             {
-                "type": "anomalie",
-                "titre": "Baisse satisfaction urgences",
-                "description": "Chute de 15% cette semaine",
-                "impact": "Critique",
-                "recommandation": "Audit immédiat du service"
+                "id": 2,
+                "nom": "Hôpital Général",
+                "type": "Hôpital Général",
+                "adresse": "456 Rue de la Médecine",
+                "ville": "Lyon",
+                "code_postal": "69001",
+                "telephone": "04 78 90 12 34",
+                "email": "contact@hopital-lyon.fr",
+                "statut": "Actif",
+                "nombre_services": 12,
+                "nombre_utilisateurs": 38
             }
         ]
         
-        # Recommandations
-        recommandations = [
-            "Augmenter le personnel aux urgences",
-            "Améliorer la formation en cardiologie",
-            "Optimiser les processus de triage",
-            "Renforcer la communication patient"
+        # Services
+        services = [
+            {
+                "id": 1,
+                "nom": "Cardiologie",
+                "organisation_id": 1,
+                "responsable": "Dr. Martin",
+                "nombre_plaintes": 23,
+                "statut": "Actif",
+                "priorite": "Élevée"
+            },
+            {
+                "id": 2,
+                "nom": "Urgences",
+                "organisation_id": 1,
+                "responsable": "Dr. Dubois",
+                "nombre_plaintes": 45,
+                "statut": "Actif",
+                "priorite": "Critique"
+            }
         ]
         
-        # Métriques avancées
-        metriques_avancees = {
-            "score_qualite_global": 8.7,
-            "efficacite_traitement": 92.3,
-            "satisfaction_patient": 4.4,
-            "temps_reponse_moyen": 2.1,
-            "taux_recurrence": 3.2
+        # Utilisateurs
+        utilisateurs = [
+            {
+                "id": 1,
+                "nom": "Jean Dupont",
+                "email": "jean.dupont@chu-paris.fr",
+                "role": "Administrateur",
+                "organisation_id": 1,
+                "statut": "Actif",
+                "derniere_connexion": "2024-01-15T10:30:00"
+            },
+            {
+                "id": 2,
+                "nom": "Marie Martin",
+                "email": "marie.martin@chu-paris.fr",
+                "role": "Gestionnaire",
+                "organisation_id": 1,
+                "statut": "Actif",
+                "derniere_connexion": "2024-01-15T09:15:00"
+            }
+        ]
+        
+        # Configurations
+        configurations = {
+            "notifications": {
+                "email": True,
+                "sms": False,
+                "push": True
+            },
+            "securite": {
+                "authentification_2fa": True,
+                "session_timeout": 3600,
+                "password_policy": "Complexe"
+            },
+            "systeme": {
+                "timezone": "Europe/Paris",
+                "langue": "fr",
+                "maintenance_mode": False
+            }
         }
         
-        analytics_v2_data = AnalyticsV2Data(
-            predictions_ia=predictions_ia,
-            insights_avances=insights_avances,
-            recommandations=recommandations,
-            metriques_avancees=metriques_avancees
+        administration_data = AdministrationData(
+            organisations=organisations,
+            services=services,
+            utilisateurs=utilisateurs,
+            configurations=configurations
         )
-        
-        # Modèles IA utilisés
-        modeles_ia_utilises = [
-            "Modèle de prédiction de charge",
-            "Modèle d'analyse de sentiment",
-            "Modèle de détection d'anomalies",
-            "Modèle de recommandation"
-        ]
         
         # APIs utilisées par cette page
         apis_utilisees = [
             "GET /analytics-v2",
-            "GET /analytics-v2/predictions",
-            "GET /analytics-v2/insights",
-            "GET /analytics-v2/recommandations",
-            "POST /analytics-v2/entrainement"
+            "GET /organisations",
+            "GET /services",
+            "GET /utilisateurs",
+            "PUT /configurations"
         ]
         
-        return AnalyticsV2Response(
+        return AdministrationResponse(
             page="analytics-v2",
             timestamp=datetime.now().isoformat(),
             success=True,
-            message="Données Analytics V2 récupérées avec succès",
+            message="Données Administration récupérées avec succès",
             data={
-                "analytics_v2": analytics_v2_data,
-                "modeles_ia_utilises": modeles_ia_utilises,
+                "administration": administration_data,
                 "apis_utilisees": apis_utilisees
             }
         )
         
     except Exception as e:
-        logger.error(f"Erreur dans get_analytics_v2_data: {str(e)}")
+        logger.error(f"Erreur dans get_administration_data: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Erreur interne: {str(e)}")
 
 # ==================== PAGE PARAMÈTRES ====================
@@ -1003,10 +1043,10 @@ async def get_all_apis_utilisees():
         ],
         "analytics-v2": [
             "GET /analytics-v2",
-            "GET /analytics-v2/predictions",
-            "GET /analytics-v2/insights",
-            "GET /analytics-v2/recommandations",
-            "POST /analytics-v2/entrainement"
+            "GET /organisations",
+            "GET /services",
+            "GET /utilisateurs",
+            "PUT /configurations"
         ],
         "parametres": [
             "GET /parametres",

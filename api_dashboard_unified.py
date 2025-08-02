@@ -56,6 +56,7 @@ class DashboardStatistiques(BaseModel):
     plaintes_en_retard: int
     en_cours_traitement: int
     traitees_ce_mois: int
+    plaintes_cloturees: int
     satisfaction_moyenne: float
     
     # Progressions et métriques
@@ -420,6 +421,7 @@ async def get_dashboard_statistiques(
             plaintes_en_retard=en_retard,
             en_cours_traitement=en_cours,
             traitees_ce_mois=traitees_mois,
+            plaintes_cloturees=cloture,
             satisfaction_moyenne=satisfaction_moyenne,
             progression=progression,
             statistiques_detaillees=statistiques_detaillees,

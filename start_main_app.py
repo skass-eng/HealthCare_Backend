@@ -85,15 +85,15 @@ def start_main_app():
     
     # Démarrer le serveur
     logger.info("🌟 Lancement de l'application principale...")
-    logger.info("📱 Page d'accueil: http://localhost:8000")
-    logger.info("📚 Documentation: http://localhost:8000/docs")
-    logger.info("🔍 Navigation: http://localhost:8000/navigation")
+    logger.info("📱 Page d'accueil: http://localhost:5000")
+    logger.info("📚 Documentation: http://localhost:5000/docs")
+    logger.info("🔍 Navigation: http://localhost:5000/navigation")
     
     try:
         uvicorn.run(
             "main_app:app",
             host="0.0.0.0",
-            port=8000,
+            port=5000,
             reload=True,
             log_level="info",
             access_log=True
