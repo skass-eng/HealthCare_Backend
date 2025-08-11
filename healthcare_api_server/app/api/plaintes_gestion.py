@@ -136,6 +136,127 @@ def get_plaintes(
         logger.error(f"❌ Erreur lors de la récupération des plaintes: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.get("/export")
+async def export_plaintes(
+    format: str = Query("csv", description="Format d'export: csv, excel, json"),
+    statut: Optional[str] = Query(None, description="Filtrer par statut"),
+    service_id: Optional[int] = Query(None, description="Filtrer par service"),
+    date_debut: Optional[datetime] = Query(None, description="Date de début"),
+    date_fin: Optional[datetime] = Query(None, description="Date de fin"),
+    db: Session = Depends(get_db)
+):
+    """
+    Exporter les plaintes selon les filtres spécifiés
+    """
+    try:
+        # Construction de la requête avec filtres
+        query = db.query(Plainte).options(
+            selectinload(Plainte.service),
+            selectinload(Plainte.assigned_user)
+        )
+
+        if statut:
+            try:
+                statut_enum = StatutPlainte(statut)
+                query = query.filter(Plainte.statut == statut_enum)
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"Statut invalide: {statut}")
+
+        if service_id:
+            query = query.filter(Plainte.service_id == service_id)
+
+        if date_debut:
+            query = query.filter(Plainte.date_creation >= date_debut)
+
+        if date_fin:
+            date_fin_inclusive = date_fin + timedelta(days=1)
+            query = query.filter(Plainte.date_creation < date_fin_inclusive)
+
+        plaintes = query.all()
+
+        if format.lower() == "csv":
+            # Export CSV
+            import csv
+            from io import StringIO
+            from fastapi.responses import Response
+            
+            output = StringIO()
+            writer = csv.writer(output)
+            
+            # En-têtes
+            writer.writerow([
+                "ID", "Titre", "Nom Plaignant", "Prénom Plaignant", 
+                "Email", "Téléphone", "Mode Réception", "Statut", 
+                "Date Création", "Service", "Utilisateur Assigné"
+            ])
+            
+            # Données
+            for plainte in plaintes:
+                writer.writerow([
+                    plainte.id,
+                    plainte.titre,
+                    plainte.nom_plaignant,
+                    plainte.prenom_plaignant,
+                    plainte.email_plaignant,
+                    plainte.telephone_plaignant,
+                    plainte.mode_reception,
+                    plainte.statut.value if plainte.statut else "",
+                    plainte.date_creation.strftime("%Y-%m-%d %H:%M:%S") if plainte.date_creation else "",
+                    plainte.service.nom if plainte.service else "",
+                    f"{plainte.assigned_user.prenom} {plainte.assigned_user.nom}" if plainte.assigned_user else ""
+                ])
+            
+            # Récupérer le contenu CSV
+            csv_content = output.getvalue()
+            output.close()
+            
+            # Ajouter le BOM UTF-8 pour Excel
+            bom = '\ufeff'
+            content_with_bom = bom + csv_content
+            
+            # Encoder en UTF-8
+            content_bytes = content_with_bom.encode('utf-8')
+            
+            # Retourner une Response avec le bon Content-Type
+            return Response(
+                content=content_bytes,
+                media_type="text/csv; charset=utf-8",
+                headers={
+                    "Content-Disposition": f"attachment; filename=plaintes_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    "Content-Type": "text/csv; charset=utf-8"
+                }
+            )
+        elif format.lower() == "excel":
+            # TODO: Implémenter l'export Excel
+            raise HTTPException(status_code=501, detail="Export Excel non encore implémenté")
+        else:
+            # Export JSON par défaut
+            plaintes_data = []
+            for plainte in plaintes:
+                plaintes_data.append({
+                    "id": plainte.id,
+                    "titre": plainte.titre,
+                    "contenu": plainte.contenu,
+                    "nom_plaignant": plainte.nom_plaignant,
+                    "prenom_plaignant": plainte.prenom_plaignant,
+                    "email_plaignant": plainte.email_plaignant,
+                    "telephone_plaignant": plainte.telephone_plaignant,
+                    "mode_reception": plainte.mode_reception,
+                    "statut": plainte.statut.value if plainte.statut else None,
+                    "date_creation": plainte.date_creation.isoformat() if plainte.date_creation else None,
+                    "date_mise_a_jour": plainte.date_mise_a_jour.isoformat() if plainte.date_mise_a_jour else None,
+                    "service": plainte.service.nom if plainte.service else None,
+                    "assigned_user": f"{plainte.assigned_user.prenom} {plainte.assigned_user.nom}" if plainte.assigned_user else None
+                })
+            
+            return {"data": plaintes_data, "total": len(plaintes_data)}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erreur lors de l'export des plaintes: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @router.get("/{plainte_id}", response_model=PlainteResponse)
 def get_plainte(plainte_id: int, db: Session = Depends(get_db)):
     """
@@ -256,78 +377,6 @@ async def delete_plainte(plainte_id: int, db: Session = Depends(get_db)):
     except Exception as e:
         db.rollback()
         logger.error(f"❌ Erreur lors de la suppression de la plainte {plainte_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.get("/export")
-async def export_plaintes(
-    format: str = Query("csv", description="Format d'export: csv, excel, json"),
-    statut: Optional[str] = Query(None, description="Filtrer par statut"),
-    service_id: Optional[int] = Query(None, description="Filtrer par service"),
-    date_debut: Optional[datetime] = Query(None, description="Date de début"),
-    date_fin: Optional[datetime] = Query(None, description="Date de fin"),
-    db: Session = Depends(get_db)
-):
-    """
-    Exporter les plaintes selon les filtres spécifiés
-    """
-    try:
-        # Construction de la requête avec filtres
-        query = db.query(Plainte).options(
-            selectinload(Plainte.service),
-            selectinload(Plainte.assigned_user)
-        )
-
-        if statut:
-            try:
-                statut_enum = StatutPlainte(statut)
-                query = query.filter(Plainte.statut == statut_enum)
-            except ValueError:
-                raise HTTPException(status_code=400, detail=f"Statut invalide: {statut}")
-
-        if service_id:
-            query = query.filter(Plainte.service_id == service_id)
-
-        if date_debut:
-            query = query.filter(Plainte.date_creation >= date_debut)
-
-        if date_fin:
-            date_fin_inclusive = date_fin + timedelta(days=1)
-            query = query.filter(Plainte.date_creation < date_fin_inclusive)
-
-        plaintes = query.all()
-
-        if format.lower() == "csv":
-            # TODO: Implémenter l'export CSV
-            raise HTTPException(status_code=501, detail="Export CSV non encore implémenté")
-        elif format.lower() == "excel":
-            # TODO: Implémenter l'export Excel
-            raise HTTPException(status_code=501, detail="Export Excel non encore implémenté")
-        else:
-            # Export JSON par défaut
-            plaintes_data = []
-            for plainte in plaintes:
-                plaintes_data.append({
-                    "id": plainte.id,
-                    "titre": plainte.titre,
-                    "contenu": plainte.contenu,
-                    "nom_plaignant": plainte.nom_plaignant,
-                    "prenom_plaignant": plainte.prenom_plaignant,
-                    "email_plaignant": plainte.email_plaignant,
-                    "telephone_plaignant": plainte.telephone_plaignant,
-                    "mode_reception": plainte.mode_reception,
-                    "statut": plainte.statut.value if plainte.statut else None,
-                    "date_creation": plainte.date_creation.isoformat() if plainte.date_creation else None,
-                    "date_mise_a_jour": plainte.date_mise_a_jour.isoformat() if plainte.date_mise_a_jour else None,
-                    "service": plainte.service.nom if plainte.service else None,
-                    "assigned_user": f"{plainte.assigned_user.prenom} {plainte.assigned_user.nom}" if plainte.assigned_user else None
-                })
-            
-            return {"data": plaintes_data, "total": len(plaintes_data)}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Erreur lors de l'export des plaintes: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ==================== ANALYSES ====================
