@@ -1,0 +1,193 @@
+# HealthCare AI - Architecture ODYSSEE
+# Docker Compose pour développement local inspiré d'ODYSSEE
+
+version: '3.8'
+
+services:
+  # Base de données PostgreSQL (obligatoire comme ODYSSEE)
+  postgres:
+    image: postgres:15-alpine
+    container_name: healthcare_postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-healthcare_odyssee}
+      POSTGRES_USER: ${POSTGRES_USER:-healthcare}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    networks:
+      - healthcare_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-healthcare}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis pour Celery et WebSockets (comme ODYSSEE)
+  redis:
+    image: redis:7-alpine
+    container_name: healthcare_redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - healthcare_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # API Server (comme ODYSSEE api_server)
+  api_server:
+    build:
+      context: ../
+      dockerfile: healthcare_api_server/Dockerfile
+    container_name: healthcare_api_server
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-healthcare}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-healthcare_odyssee}
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - ENVIRONMENT=development
+      - DEBUG=true
+      - LOG_LEVEL=INFO
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../healthcare_api_server:/app
+      - storage_data:/app/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - healthcare_network
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Worker Server Celery (comme ODYSSEE worker_server)
+  worker_server:
+    build:
+      context: ../
+      dockerfile: healthcare_worker_server/Dockerfile
+    container_name: healthcare_worker_server
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-healthcare}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-healthcare_odyssee}
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - LLM_MODEL=${LLM_MODEL:-gpt-3.5-turbo}
+      - ENVIRONMENT=development
+      - LOG_LEVEL=INFO
+    volumes:
+      - ../healthcare_worker_server:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - healthcare_network
+    command: celery -A app.core.celery_app worker --loglevel=info --queues=analyses,sentiment,classification
+    deploy:
+      replicas: 2  # Plusieurs workers comme ODYSSEE
+
+  # Worker Celery Beat (pour tâches programmées)
+  worker_beat:
+    build:
+      context: ../
+      dockerfile: healthcare_worker_server/Dockerfile
+    container_name: healthcare_worker_beat
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-healthcare}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-healthcare_odyssee}
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - ENVIRONMENT=development
+      - LOG_LEVEL=INFO
+    volumes:
+      - ../healthcare_worker_server:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - healthcare_network
+    command: celery -A app.core.celery_app beat --loglevel=info
+
+  # Monitoring Celery Flower (comme ODYSSEE monitoring)
+  flower:
+    build:
+      context: ../
+      dockerfile: healthcare_worker_server/Dockerfile
+    container_name: healthcare_flower
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+    networks:
+      - healthcare_network
+    command: celery -A app.core.celery_app flower --host=0.0.0.0 --port=5555
+
+  # PgAdmin (optionnel pour administration PostgreSQL)
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: healthcare_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@healthcare.local
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    ports:
+      - "8080:80"
+    depends_on:
+      - postgres
+    networks:
+      - healthcare_network
+    profiles:
+      - admin
+
+  # Redis Commander (optionnel pour administration Redis)
+  redis_commander:
+    image: rediscommander/redis-commander:latest
+    container_name: healthcare_redis_commander
+    environment:
+      REDIS_HOSTS: local:redis:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    networks:
+      - healthcare_network
+    profiles:
+      - admin
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  storage_data:
+    driver: local
+
+networks:
+  healthcare_network:
+    driver: bridge
+
+# Profils pour différents environnements
+# Développement complet: docker-compose up
+# Production: docker-compose --profile production up
+# Avec admin: docker-compose --profile admin up

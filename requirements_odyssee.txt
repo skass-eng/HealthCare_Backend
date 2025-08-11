@@ -1,0 +1,64 @@
+# HealthCare AI - Architecture ODYSSEE
+# Dépendances pour l'architecture séparée API Server / Worker Server
+
+# FastAPI et serveur web
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+python-multipart==0.0.9
+websockets==14.1
+
+# Base de données et ORM
+sqlalchemy==2.0.36
+psycopg2-binary==2.9.9
+asyncpg==0.29.0
+alembic==1.14.0
+
+# Validation et schémas
+pydantic==2.11.7
+pydantic-settings==2.8.0
+email-validator>=1.1.0,<2.2
+
+# Tâches asynchrones (Celery + Redis)
+celery[redis]==5.3.4
+redis>=4.5.2,<5.0.0
+kombu==5.3.4
+
+# Authentification et sécurité
+fastapi-users[sqlalchemy]==13.0.0
+fastapi-users[oauth]==13.0.0
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+
+# Traitement de fichiers et IA
+aiofiles==24.1.0
+PyPDF2==3.0.1
+pdfplumber==0.11.4
+python-magic==0.4.27
+reportlab==4.1.0
+
+# LLM et IA
+openai==1.54.4
+anthropic==0.37.1
+langchain==0.3.9
+langchain-openai==0.2.8
+langchain-anthropic==0.2.4
+
+# Utilitaires
+python-dotenv==1.0.1
+python-decouple==3.8
+httpx==0.28.1
+Pillow==11.0.0
+requests==2.32.3
+
+# Monitoring et logs
+structlog==24.4.0
+sentry-sdk[fastapi]==2.18.0
+
+# Tests (optionnel)
+pytest==8.3.3
+pytest-asyncio==0.24.0
+pytest-mock==3.14.0
+httpx==0.28.1
+
+# Production
+gunicorn==23.0.0

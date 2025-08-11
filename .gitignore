@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+.env
+
+# Logs
+*.log
+logs/
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Frontend (Node.js/Vite)
+node_modules/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# PDF, uploads, and generated data
+data/documents/
+data/pdf/
+data/pdfs/
+data/pdf_reports/
+uploads/
+
+# Celery
+celery.db
+
+# Others
+*.bak
+*.tmp
+*.temp
