@@ -211,6 +211,58 @@ def get_users_for_assignment(db: Session = Depends(get_db)):
         logger.error(f"Erreur lors de la récupération des utilisateurs: {e}")
         raise HTTPException(status_code=500, detail="Erreur interne du serveur")
 
+async def launch_background_analysis(plainte_id: int):
+    """
+    Fonction pour lancer les tâches d'analyse en arrière-plan
+    """
+    try:
+        from ..db.database import get_db
+        
+        # Créer une nouvelle session DB pour les tâches background
+        db = next(get_db())
+        
+        logger.info(f"🚀 Lancement des tâches en arrière-plan pour plainte {plainte_id}")
+        
+        # Récupérer l'analyse IA
+        analyse_ia = db.query(AnalyseIA).filter(AnalyseIA.plainte_id == plainte_id).first()
+        
+        # Déclenchement automatique de l'analyse IA via Celery
+        task_id = None
+        try:
+            # Utiliser le nouveau système Celery avec génération PDF et analyse IA
+            task_result = trigger_plainte_analysis(plainte_id)
+            task_id = task_result['task_id']
+            logger.info(f"🚀 Tâche Celery déclenchée pour plainte {plainte_id}: Task={task_id}")
+            
+            # Mettre à jour le statut pour indiquer que le traitement a commencé
+            if analyse_ia:
+                analyse_ia.statut_analyse = "en_cours"
+                db.commit()
+            
+        except Exception as e:
+            logger.warning(f"Worker Celery non disponible pour plainte {plainte_id}: {e}")
+            # Solution de contournement : générer PDF directement + analyse simple
+            try:
+                pdf_path = generate_pdf_synchrone(plainte_id, db)
+                logger.info(f"📄 PDF généré en mode synchrone: {pdf_path}")
+            except Exception as pdf_error:
+                logger.error(f"Erreur génération PDF synchrone: {pdf_error}")
+            
+            # Simuler une analyse simple si le worker n'est pas disponible
+            if analyse_ia:
+                analyse_ia.sentiment = "neutre"
+                analyse_ia.categorie_principale = "generale"
+                analyse_ia.mots_cles = json.dumps(["plainte", "service"])
+                analyse_ia.statut_analyse = "complete_simulation"
+                db.commit()
+                logger.info(f"✅ Analyse IA simulée pour plainte {plainte_id}")
+        
+        db.close()
+        logger.info(f"✅ Tâches en arrière-plan terminées pour plainte {plainte_id}")
+        
+    except Exception as e:
+        logger.error(f"Erreur dans les tâches en arrière-plan pour plainte {plainte_id}: {e}")
+
 @router.get("/services", response_model=List[dict])
 def get_services_for_assignment(
     actif_seulement: bool = Query(True, description="Récupérer seulement les services actifs"),
@@ -277,6 +329,7 @@ async def options_create_complaint():
 
 @router.post("/nouvelle", response_model=PlainteResponse)
 async def create_new_complaint(
+    background_tasks: BackgroundTasks,
     # Données du plaignant
     nom_plaignant: str = Form(...),
     prenom_plaignant: str = Form(...),
@@ -383,30 +436,10 @@ async def create_new_complaint(
         db.add(analyse_ia)
         db.commit()
         
-        # Déclenchement de l'analyse IA via Celery
-        try:
-            # Utiliser le nouveau système Celery avec génération PDF
-            task_result = trigger_plainte_analysis(new_plainte.id)
-            logger.info(f"🚀 Tâche Celery déclenchée pour plainte {new_plainte.id}: Task={task_result['task_id']}")
-        except Exception as e:
-            logger.warning(f"Worker Celery non disponible pour plainte {new_plainte.id}: {e}")
-            # Solution de contournement : générer PDF directement + analyse simple
-            try:
-                pdf_path = generate_pdf_synchrone(new_plainte.id, db)
-                logger.info(f"📄 PDF généré en mode synchrone: {pdf_path}")
-            except Exception as pdf_error:
-                logger.error(f"Erreur génération PDF synchrone: {pdf_error}")
-            
-            # Simuler une analyse simple si le worker n'est pas disponible
-            if analyse_ia:
-                analyse_ia.sentiment = "neutre"
-                analyse_ia.categorie_principale = "generale"
-                analyse_ia.mots_cles = json.dumps(["plainte", "service"])
-                analyse_ia.statut_analyse = "complete_simulation"
-                db.commit()
-                logger.info(f"✅ Analyse IA simulée pour plainte {new_plainte.id}")
+        # 🚀 RÉPONSE RAPIDE : Lancer les tâches en arrière-plan APRÈS avoir répondu
+        background_tasks.add_task(launch_background_analysis, new_plainte.id)
         
-        # Préparer la réponse
+        # Préparer la réponse rapide (sans attendre les tâches)
         response_data = {
             "id": str(new_plainte.id),
             "numero_plainte": new_plainte.numero_plainte,
@@ -422,7 +455,15 @@ async def create_new_complaint(
             "priorite": new_plainte.priorite.value,
             "statut": new_plainte.statut.value,
             "date_creation": new_plainte.date_creation.isoformat(),
-            "date_modification": new_plainte.date_modification.isoformat() if new_plainte.date_modification else None
+            "date_modification": new_plainte.date_modification.isoformat() if new_plainte.date_modification else None,
+            # Informations sur les tâches en arrière-plan
+            "task_info": {
+                "status": "plainte_created",
+                "background_processing": "started",
+                "pdf_generation": "en_cours",
+                "ai_analysis": "en_cours",
+                "status_endpoint": f"/api/tasks/plainte/{new_plainte.id}/status"
+            }
         }
         
         # Retourner une JSONResponse avec en-têtes CORS explicites

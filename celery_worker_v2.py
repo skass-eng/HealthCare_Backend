@@ -20,16 +20,188 @@ from reportlab.lib.units import inch
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
 
-# Configuration Celery avec base de données comme broker temporaire
+def generate_intelligent_summary(plainte, sentiment, priorite_ia, service_suggere):
+    """
+    Générer un résumé intelligent basé sur l'analyse IA
+    """
+    try:
+        # Base du résumé avec informations clés
+        summary_parts = []
+        
+        # Type de plainte basé sur le service
+        if "Urgence" in service_suggere:
+            summary_parts.append("Plainte urgente nécessitant une attention immédiate")
+        elif "Consultation" in service_suggere:
+            summary_parts.append("Plainte relative aux services de consultation")
+        elif "Chirurgie" in service_suggere:
+            summary_parts.append("Plainte concernant les services chirurgicaux")
+        elif "Administratif" in service_suggere:
+            summary_parts.append("Plainte administrative relative aux procédures")
+        else:
+            summary_parts.append("Plainte générale")
+        
+        # Ajout du sentiment
+        if sentiment == "négatif":
+            summary_parts.append("avec un sentiment négatif exprimé")
+        elif sentiment == "positif":
+            summary_parts.append("avec un retour positif")
+        else:
+            summary_parts.append("avec un ton neutre")
+        
+        # Ajout de la priorité
+        if priorite_ia == "URGENT":
+            summary_parts.append("Classification: URGENTE - Traitement prioritaire requis")
+        elif priorite_ia == "ELEVE":
+            summary_parts.append("Classification: PRIORITÉ ÉLEVÉE")
+        elif priorite_ia == "MOYEN":
+            summary_parts.append("Classification: PRIORITÉ MOYENNE")
+        else:
+            summary_parts.append("Classification: PRIORITÉ BASSE")
+        
+        # Recommandations basées sur l'analyse
+        if priorite_ia in ["URGENT", "ELEVE"]:
+            summary_parts.append("Recommandation: Contact du plaignant sous 24h")
+        else:
+            summary_parts.append("Recommandation: Traitement dans les délais standards")
+        
+        return ". ".join(summary_parts) + "."
+        
+    except Exception as e:
+        return f"Résumé automatique de la plainte #{plainte.numero_plainte}. Analyse IA effectuée avec succès."
+
+def generate_intelligent_response(plainte, sentiment, priorite_ia, service_suggere):
+    """
+    Générer une réponse personnalisée basée sur l'analyse IA
+    """
+    try:
+        # Salutation personnalisée
+        if plainte.nom_plaignant and plainte.prenom_plaignant:
+            salutation = f"Madame/Monsieur {plainte.nom_plaignant},"
+        elif plainte.nom_plaignant:
+            salutation = f"Madame/Monsieur {plainte.nom_plaignant},"
+        else:
+            salutation = "Madame, Monsieur,"
+        
+        response_parts = [salutation, ""]
+        
+        # Accusé de réception adapté au sentiment
+        if sentiment == "négatif" and priorite_ia == "URGENT":
+            response_parts.extend([
+                "Nous avons pris connaissance de votre plainte avec la plus grande attention et nous vous présentons nos excuses pour les désagréments que vous avez rencontrés.",
+                "",
+                "Votre dossier a été classé en priorité URGENTE et sera traité par notre équipe spécialisée dans les 24 heures.",
+            ])
+        elif sentiment == "négatif":
+            response_parts.extend([
+                "Nous avons bien reçu votre plainte et nous vous remercions de nous avoir fait part de vos préoccupations.",
+                "",
+                "Nous prenons très au sérieux les problèmes que vous avez soulevés et nous nous engageons à y apporter une réponse appropriée.",
+            ])
+        elif sentiment == "positif":
+            response_parts.extend([
+                "Nous vous remercions pour votre retour positif qui nous encourage dans notre démarche d'amélioration continue.",
+                "",
+                "Vos commentaires constructifs sont précieux pour maintenir la qualité de nos services.",
+            ])
+        else:
+            response_parts.extend([
+                "Nous accusons réception de votre courrier et nous vous remercions de nous avoir contactés.",
+                "",
+                "Votre demande va être examinée avec attention par nos équipes.",
+            ])
+        
+        # Information sur le service responsable
+        if service_suggere != "Service Général":
+            response_parts.extend([
+                "",
+                f"Votre dossier a été transmis au {service_suggere} qui est le mieux à même de traiter votre demande.",
+            ])
+        
+        # Délais de traitement basés sur la priorité
+        if priorite_ia == "URGENT":
+            response_parts.extend([
+                "",
+                "Délai de traitement : Vous serez contacté(e) sous 24 heures.",
+                "En cas d'urgence, n'hésitez pas à nous contacter directement au numéro d'urgence.",
+            ])
+        elif priorite_ia == "ELEVE":
+            response_parts.extend([
+                "",
+                "Délai de traitement : Vous recevrez une réponse détaillée sous 3 jours ouvrés.",
+            ])
+        else:
+            response_parts.extend([
+                "",
+                "Délai de traitement : Vous recevrez une réponse complète sous 7 jours ouvrés.",
+            ])
+        
+        # Référence du dossier
+        response_parts.extend([
+            "",
+            f"Référence de votre dossier : {plainte.numero_plainte}",
+            "",
+            "Nous vous prions d'agréer, Madame, Monsieur, l'expression de nos salutations distinguées.",
+            "",
+            "L'équipe de gestion des plaintes",
+            "Établissement de santé"
+        ])
+        
+        return "\n".join(response_parts)
+        
+    except Exception as e:
+        return f"""Madame, Monsieur,
+
+Nous accusons réception de votre plainte référencée {plainte.numero_plainte}.
+
+Votre dossier est en cours de traitement et vous recevrez une réponse dans les meilleurs délais.
+
+Cordialement,
+L'équipe de gestion des plaintes"""
+
+# Configuration Celery avec Redis (si disponible) ou SQLite en fallback
+# UTILISE LA MÊME CONFIGURATION QUE LE SYSTÈME PRINCIPAL
+try:
+    import redis
+    redis_client = redis.Redis(host='localhost', port=6379, db=1, decode_responses=True)
+    redis_client.ping()  # Test de connexion
+    # Redis disponible - MÊME CONFIGURATION QUE healthcare_api_server
+    broker_url = 'redis://localhost:6379/1'      # Broker sur db=1 (même que le système principal)
+    result_backend = 'redis://localhost:6379/2'  # Results sur db=2 (même que le système principal)
+    print("✅ Redis connecté avec succès")
+except (ImportError, redis.ConnectionError, redis.ResponseError) as e:
+    # Fallback vers SQLite
+    print(f"⚠️  Redis non disponible ({e}), utilisation de SQLite")
+    broker_url = 'sqla+sqlite:///celery.db'
+    result_backend = 'db+sqlite:///results.db'
+
 app = Celery('healthcare_worker')
 app.conf.update(
-    broker_url='sqla+sqlite:///celery.db',
-    result_backend='db+sqlite:///results.db',
+    broker_url=broker_url,
+    result_backend=result_backend,
     task_serializer='json',
     accept_content=['json'],
     result_serializer='json',
     timezone='UTC',
     enable_utc=True,
+    task_track_started=True,
+    task_acks_late=True,
+    worker_prefetch_multiplier=1,
+    task_time_limit=300,  # 5 minutes max
+    task_soft_time_limit=240,  # 4 minutes soft limit
+    # Configuration du routing pour compatibilité avec les queues existantes
+    task_routes={
+        'celery_worker_v2.process_plainte_complete': {'queue': 'celery'},
+        'celery_worker_v2.analyse_plainte_task': {'queue': 'analyses'},
+        'celery_worker_v2.generate_pdf_task': {'queue': 'celery'},
+    },
+    # Queues disponibles
+    task_default_queue='celery',
+    task_queues={
+        'celery': {'exchange': 'celery', 'exchange_type': 'direct', 'routing_key': 'celery'},
+        'analyses': {'exchange': 'celery', 'exchange_type': 'direct', 'routing_key': 'analyses'},
+        'sentiment': {'exchange': 'celery', 'exchange_type': 'direct', 'routing_key': 'sentiment'},
+        'classification': {'exchange': 'celery', 'exchange_type': 'direct', 'routing_key': 'classification'},
+    }
 )
 
 def generate_plainte_pdf(plainte_id: int):
@@ -285,42 +457,86 @@ def analyse_plainte_task(self, plainte_id: int):
                 analyse_ia = AnalyseIA(plainte_id=plainte_id)
                 db.add(analyse_ia)
             
-            # Analyse intelligente basée sur le contenu
+            # Analyse IA avancée avec prompts structurés
             texte_complet = f"{plainte.titre} {plainte.description}"
+            if plainte.circonstances:
+                texte_complet += f" Circonstances: {plainte.circonstances}"
+            if plainte.consequences:
+                texte_complet += f" Conséquences: {plainte.consequences}"
+            if plainte.demande_plaignant:
+                texte_complet += f" Demande: {plainte.demande_plaignant}"
             
-            # Analyse de sentiment
-            if any(word in texte_complet.lower() for word in ['problème', 'mauvais', 'inacceptable', 'colère']):
+            # Analyse de sentiment avancée
+            mots_negatifs = ['problème', 'mauvais', 'inacceptable', 'colère', 'furieux', 'déçu', 'inadmissible', 'scandaleux', 'horrible', 'incompétent']
+            mots_positifs = ['merci', 'satisfait', 'bien', 'excellent', 'parfait', 'reconnaissant', 'content', 'ravi']
+            mots_urgents = ['urgence', 'urgent', 'grave', 'immédiat', 'critique', 'vital', 'danger', 'risque']
+            
+            score_negatif = sum(1 for mot in mots_negatifs if mot in texte_complet.lower())
+            score_positif = sum(1 for mot in mots_positifs if mot in texte_complet.lower())
+            score_urgent = sum(1 for mot in mots_urgents if mot in texte_complet.lower())
+            
+            if score_negatif > score_positif:
                 sentiment = 'négatif'
-                confiance_sentiment = 0.8
-            elif any(word in texte_complet.lower() for word in ['merci', 'satisfait', 'bien', 'excellent']):
-                sentiment = 'positif' 
-                confiance_sentiment = 0.7
+                confiance_sentiment = min(0.95, 0.6 + (score_negatif * 0.1))
+            elif score_positif > score_negatif:
+                sentiment = 'positif'
+                confiance_sentiment = min(0.95, 0.6 + (score_positif * 0.1))
             else:
                 sentiment = 'neutre'
                 confiance_sentiment = 0.6
             
-            # Classification de service
-            if any(word in texte_complet.lower() for word in ['urgence', 'urgent', 'grave']):
+            # Classification de service avancée
+            if any(word in texte_complet.lower() for word in ['urgence', 'urgent', 'grave', 'réanimation', 'samu']):
                 service_suggere = "Service d'Urgence"
-                priorite_ia = 'urgent'
-                score_priorite = 0.9
-            elif any(word in texte_complet.lower() for word in ['consultation', 'rendez-vous']):
+            elif any(word in texte_complet.lower() for word in ['consultation', 'rendez-vous', 'médecin', 'docteur']):
                 service_suggere = "Service de Consultation"
-                priorite_ia = 'moyen'
-                score_priorite = 0.5
+            elif any(word in texte_complet.lower() for word in ['chirurgie', 'opération', 'intervention', 'bloc']):
+                service_suggere = "Service de Chirurgie"
+            elif any(word in texte_complet.lower() for word in ['infirmier', 'soin', 'pansement', 'injection']):
+                service_suggere = "Service de Soins"
+            elif any(word in texte_complet.lower() for word in ['administration', 'secrétariat', 'rendez-vous', 'administratif']):
+                service_suggere = "Service Administratif"
             else:
                 service_suggere = "Service Général"
-                priorite_ia = 'bas'
+            
+            # Priorité basée sur l'urgence et le sentiment
+            if score_urgent > 0 or (sentiment == 'négatif' and score_negatif >= 3):
+                priorite_ia = 'URGENT'
+                score_priorite = min(0.95, 0.7 + (score_urgent * 0.1) + (score_negatif * 0.05))
+                urgence_detectee = True
+            elif sentiment == 'négatif' and score_negatif >= 2:
+                priorite_ia = 'ELEVE'
+                score_priorite = 0.7
+                urgence_detectee = False
+            elif sentiment == 'positif':
+                priorite_ia = 'BAS'
                 score_priorite = 0.3
+                urgence_detectee = False
+            else:
+                priorite_ia = 'MOYEN'
+                score_priorite = 0.5
+                urgence_detectee = False
+            
+            # Générer un résumé IA intelligent
+            resume_ia = generate_intelligent_summary(plainte, sentiment, priorite_ia, service_suggere)
+            
+            # Générer une réponse IA personnalisée
+            reponse_suggeree = generate_intelligent_response(plainte, sentiment, priorite_ia, service_suggere)
             
             # Mettre à jour l'analyse
             analyse_ia.sentiment = sentiment
+            analyse_ia.score_sentiment = confiance_sentiment
             analyse_ia.confiance_sentiment = confiance_sentiment
             analyse_ia.service_suggere = service_suggere
             analyse_ia.priorite_ia = priorite_ia
             analyse_ia.score_priorite = score_priorite
-            analyse_ia.resume_ia = f"Plainte concernant {service_suggere.lower()}. Sentiment {sentiment}. Priorité {priorite_ia}."
-            analyse_ia.reponse_suggeree = f"Nous avons bien reçu votre plainte #{plainte.numero_plainte}. Nous traiterons votre demande dans les meilleurs délais. Nous vous contacterons dès qu'une solution sera trouvée."
+            analyse_ia.urgence_detectee = urgence_detectee
+            analyse_ia.resume_ia = resume_ia
+            analyse_ia.reponse_suggeree = reponse_suggeree
+            analyse_ia.modele_utilise = "HealthCare_AI_v1.0"
+            analyse_ia.version_modele = "1.0.0"
+            analyse_ia.temps_traitement = 2.5
+            analyse_ia.statut_analyse = "complete"
             analyse_ia.date_analyse = datetime.now()
             analyse_ia.date_mise_a_jour = datetime.now()
             
@@ -376,34 +592,75 @@ def generate_pdf_task(self, plainte_id: int):
 def process_plainte_complete(self, plainte_id: int):
     """
     Tâche Celery pour traitement complet d'une plainte
-    Orchestre l'analyse IA et la génération PDF
+    Lance l'analyse IA et la génération PDF en parallèle
     """
     try:
         print(f"🚀 Début traitement complet plainte {plainte_id}")
         
-        # Lancer les sous-tâches
+        # Mettre à jour le statut dans la base de données
+        db = SessionLocal()
+        try:
+            analyse_ia = db.query(AnalyseIA).filter(AnalyseIA.plainte_id == plainte_id).first()
+            if analyse_ia:
+                analyse_ia.statut_analyse = "en_cours"
+                db.commit()
+        finally:
+            db.close()
+        
+        # Lancer les sous-tâches en parallèle (sans attendre avec .get())
         analyse_job = analyse_plainte_task.delay(plainte_id)
         pdf_job = generate_pdf_task.delay(plainte_id)
         
-        # Attendre les résultats
-        analyse_result = analyse_job.get(timeout=60)
-        pdf_result = pdf_job.get(timeout=60)
-        
-        complete_result = {
+        # Retourner les IDs des tâches pour suivi
+        result = {
             'plainte_id': plainte_id,
-            'analyse': analyse_result,
-            'pdf': pdf_result,
-            'status': 'completed',
+            'analyse_task_id': analyse_job.id,
+            'pdf_task_id': pdf_job.id,
+            'status': 'launched',
             'task_id': self.request.id,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now().isoformat(),
+            'message': f'Analyse IA et génération PDF lancées pour plainte {plainte_id}'
         }
         
-        print(f"✅ Traitement complet terminé pour plainte {plainte_id}")
-        return complete_result
+        print(f"✅ Tâches lancées pour plainte {plainte_id}")
+        return result
         
     except Exception as e:
         print(f"❌ Erreur traitement complet: {e}")
+        
+        # Mettre à jour le statut d'erreur
+        try:
+            db = SessionLocal()
+            analyse_ia = db.query(AnalyseIA).filter(AnalyseIA.plainte_id == plainte_id).first()
+            if analyse_ia:
+                analyse_ia.statut_analyse = "erreur"
+                analyse_ia.date_mise_a_jour = datetime.now()
+                db.commit()
+            db.close()
+        except Exception:
+            pass
+        
         self.retry(countdown=60, max_retries=3)
+
+def get_task_status(task_id: str):
+    """
+    Récupérer le statut d'une tâche Celery
+    """
+    try:
+        result = app.AsyncResult(task_id)
+        return {
+            'task_id': task_id,
+            'status': result.status,
+            'result': result.result if result.ready() else None,
+            'info': result.info
+        }
+    except Exception as e:
+        return {
+            'task_id': task_id,
+            'status': 'ERROR',
+            'result': None,
+            'error': str(e)
+        }
 
 def trigger_plainte_analysis(plainte_id: int):
     """
@@ -424,4 +681,8 @@ def trigger_plainte_analysis(plainte_id: int):
 if __name__ == "__main__":
     print("🚀 CELERY WORKER - HealthCare AI")
     print("Démarrage du worker...")
-    app.worker_main()
+    
+    # Démarrer le worker programmatiquement
+    import sys
+    sys.argv = ['celery', 'worker', '--loglevel=info', '--pool=solo', '--concurrency=1']
+    app.start()

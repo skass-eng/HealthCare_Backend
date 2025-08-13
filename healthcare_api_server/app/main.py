@@ -16,7 +16,7 @@ from typing import Optional
 
 from .core.config import settings
 from .db.database import init_database, close_database
-from .api import plaintes_creation, plaintes_gestion, websockets, auth, healthcare_ai, users, services_kpi
+from .api import plaintes_creation, plaintes_gestion, websockets, auth, healthcare_ai, users, services_kpi, task_status
 
 # Configuration du logging
 logging.basicConfig(
@@ -161,7 +161,11 @@ app.include_router(
     tags=["Utilisateurs"]
 )
 
-
+# Routeur pour le statut des tâches
+app.include_router(
+    task_status.router,
+    tags=["Statut des Tâches"]
+)
 
 app.include_router(
     websockets.router,
