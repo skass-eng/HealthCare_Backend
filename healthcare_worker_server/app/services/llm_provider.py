@@ -29,11 +29,80 @@ class BaseLLMService(ABC):
         self.api_key = api_key
         self.model = model
         self.config = kwargs
+        self.model_name = model or "unknown"
     
     @abstractmethod
     async def analyze(self, prompt: str, parameters: Dict[str, Any] = None) -> str:
         """Analyser un prompt et retourner la réponse"""
         pass
+    
+    def generate_response(self, prompt: str, parameters: Dict[str, Any] = None) -> str:
+        """Version synchrone pour compatibilité avec l'architecture modulaire"""
+        # Simulation simple pour le développement
+        logger.info(f"Génération de réponse LLM (simulation) - Modèle: {self.model_name}")
+        
+        # Analyser le type de prompt pour générer une réponse appropriée
+        if "sentiment" in prompt.lower():
+            return self._generate_sentiment_response()
+        elif "résumé" in prompt.lower() or "summary" in prompt.lower():
+            return self._generate_summary_response()
+        elif "contact" in prompt.lower():
+            return self._generate_contacts_response()
+        elif "juridique" in prompt.lower() or "legal" in prompt.lower():
+            return self._generate_legal_response()
+        else:
+            return self._generate_generic_response()
+    
+    def _generate_sentiment_response(self) -> str:
+        """Génère une réponse simulée pour l'analyse de sentiment"""
+        return """{
+    "sentiment_principal": "négatif",
+    "intensite_emotionnelle": "modérée",
+    "score_sentiment": -0.6,
+    "mots_cles_emotionnels": ["insatisfait", "déçu", "problème"],
+    "recommandations_reponse": "Adopter un ton empathique et proposer des solutions concrètes"
+}"""
+    
+    def _generate_summary_response(self) -> str:
+        """Génère une réponse simulée pour le résumé"""
+        return """{
+    "resume_executif": "Plainte concernant un problème de service nécessitant une attention particulière et un suivi approprié.",
+    "faits_principaux": ["Problème de service identifié", "Demande de suivi du patient", "Nécessité d'amélioration"],
+    "services_concernes": ["Service concerné", "Direction qualité"],
+    "nature_probleme": "Problème de qualité de service",
+    "demande_plaignant": "Amélioration du service et suivi",
+    "date_incident": "non précisée",
+    "gravite_estimee": "modérée"
+}"""
+    
+    def _generate_contacts_response(self) -> str:
+        """Génère une réponse simulée pour l'extraction de contacts"""
+        return """{
+    "personnes_mentionnees": [],
+    "services_departements": [
+        {
+            "nom": "Service concerné", 
+            "contexte": "Service impliqué dans la plainte"
+        }
+    ],
+    "coordonnees_trouvees": [],
+    "interlocuteurs_cles": []
+}"""
+    
+    def _generate_legal_response(self) -> str:
+        """Génère une réponse simulée pour la réponse juridique"""
+        return """{
+    "reponse_officielle": "Madame, Monsieur,\\n\\nNous avons pris connaissance de votre signalement et tenons à vous remercier de nous avoir fait part de vos préoccupations. Notre établissement accorde une importance primordiale à la qualité des soins et des services fournis à nos patients.\\n\\nUne enquête interne a été diligentée afin d'examiner les éléments que vous avez portés à notre attention. Nous mettons tout en œuvre pour assurer la continuité et l'amélioration de nos prestations.\\n\\nNous restons à votre disposition pour tout complément d'information.\\n\\nCordialement,\\nLe Responsable Qualité",
+    "points_cles": ["Accusé de réception", "Enquête interne", "Engagement qualité"],
+    "actions_proposees": ["Enquête interne", "Suivi des améliorations"],
+    "engagement_suivi": "Suivi régulier et communication des résultats",
+    "tone_juridique": "Professionnel, empathique, sans admission de responsabilité",
+    "recommandations_internes": ["Révision des procédures", "Formation du personnel"]
+}"""
+    
+    def _generate_generic_response(self) -> str:
+        """Génère une réponse générique"""
+        return "Analyse effectuée avec succès."
     
     @abstractmethod
     def parse_json_response(self, response: str) -> Dict[str, Any]:

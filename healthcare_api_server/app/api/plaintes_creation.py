@@ -34,7 +34,18 @@ from shared.schemas import (
 # from ..core.auth import get_current_user  # Désactivé pour le développement
 from ..services.task_manager import trigger_analyse_plainte
 # from ..services.worker_tasks import trigger_analyse_plainte_complete  # Ancien système simulé
-from celery_worker_v2 import trigger_plainte_analysis  # Nouveau système Celery avec PDF
+from celery_worker_v2 import trigger_plainte_analysis  # Système Celery v2
+
+logger = logging.getLogger(__name__)
+
+# Import du nouveau système modulaire
+try:
+    from healthcare_worker_server.app.tasks.celery_tasks import process_complaint_complete
+    MODULAR_WORKER_AVAILABLE = True
+    logger.info("Worker modulaire disponible")
+except ImportError:
+    MODULAR_WORKER_AVAILABLE = False
+    logger.warning("Worker modulaire non disponible - utilisation du worker v2")
 
 logger = logging.getLogger(__name__)
 
@@ -214,6 +225,7 @@ def get_users_for_assignment(db: Session = Depends(get_db)):
 async def launch_background_analysis(plainte_id: int):
     """
     Fonction pour lancer les tâches d'analyse en arrière-plan
+    Utilise le worker modulaire si disponible, sinon fallback sur v2
     """
     try:
         from ..db.database import get_db
@@ -229,10 +241,18 @@ async def launch_background_analysis(plainte_id: int):
         # Déclenchement automatique de l'analyse IA via Celery
         task_id = None
         try:
-            # Utiliser le nouveau système Celery avec génération PDF et analyse IA
-            task_result = trigger_plainte_analysis(plainte_id)
-            task_id = task_result['task_id']
-            logger.info(f"🚀 Tâche Celery déclenchée pour plainte {plainte_id}: Task={task_id}")
+            if MODULAR_WORKER_AVAILABLE:
+                # Utiliser le nouveau worker modulaire
+                logger.info(f"📦 Utilisation du worker modulaire pour plainte {plainte_id}")
+                task_result = process_complaint_complete.delay(plainte_id)
+                task_id = task_result.id
+                logger.info(f"🚀 Tâche modulaire déclenchée: Task={task_id}")
+            else:
+                # Fallback sur le worker v2
+                logger.info(f"📦 Fallback worker v2 pour plainte {plainte_id}")
+                task_result = trigger_plainte_analysis(plainte_id)
+                task_id = task_result['task_id']
+                logger.info(f"🚀 Tâche Celery v2 déclenchée: Task={task_id}")
             
             # Mettre à jour le statut pour indiquer que le traitement a commencé
             if analyse_ia:

@@ -16,7 +16,7 @@ from typing import Optional
 
 from .core.config import settings
 from .db.database import init_database, close_database
-from .api import plaintes_creation, plaintes_gestion, websockets, auth, healthcare_ai, users, services_kpi, task_status
+from .api import plaintes_creation, plaintes_gestion, websockets, auth, healthcare_ai, users, services_kpi, task_status, test_endpoint
 
 # Configuration du logging
 logging.basicConfig(
@@ -170,6 +170,13 @@ app.include_router(
 app.include_router(
     websockets.router,
     tags=["WebSockets"]
+)
+
+# Routeur de test pour l'intégration modulaire
+app.include_router(
+    test_endpoint.router,
+    prefix="/api/v1",
+    tags=["Test - API Modulaire"]
 )
 
 # Gestionnaire d'erreurs global
