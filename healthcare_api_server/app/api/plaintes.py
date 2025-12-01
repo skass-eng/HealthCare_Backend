@@ -574,10 +574,11 @@ async def get_statistiques_departements(
 ):
     """
     Récupérer les statistiques par département/service pour la page Vue d'ensemble
+    Inclut tous les services actifs, même ceux sans plaintes
     """
     try:
         # Récupérer les statistiques par service avec les vraies données
-        # Utiliser une requête plus précise pour correspondre aux données réelles
+        # Utiliser outerjoin pour inclure les services sans plaintes
         services_stats = db.query(
             Service.id,
             Service.nom,
@@ -587,10 +588,12 @@ async def get_statistiques_departements(
             func.sum(case((Plainte.statut == StatutPlainte.EN_COURS.value, 1), else_=0)).label('en_cours'),
             func.sum(case((Plainte.statut == StatutPlainte.TRAITE.value, 1), else_=0)).label('traitees'),
             func.sum(case((Plainte.statut == StatutPlainte.CLOTURE.value, 1), else_=0)).label('cloturees')
-        ).outerjoin(Plainte, Service.id == Plainte.service_id).group_by(
-            Service.id, Service.nom, Service.categorie
         ).filter(
             Service.est_actif == True  # Seulement les services actifs
+        ).outerjoin(
+            Plainte, Service.id == Plainte.service_id
+        ).group_by(
+            Service.id, Service.nom, Service.categorie
         ).all()
         
         # Convertir en format attendu par le frontend

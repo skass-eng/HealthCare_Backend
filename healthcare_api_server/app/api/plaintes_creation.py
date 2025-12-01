@@ -24,9 +24,10 @@ from reportlab.lib.units import inch
 from reportlab.lib.colors import black, blue, red, grey
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
+import mimetypes
 
 from ..db.database import get_db
-from shared.models import Plainte, User, Service, Analyse, StatutPlainte, PrioritePlainte, AnalyseIA
+from shared.models import Plainte, User, Service, Analyse, StatutPlainte, PrioritePlainte, AnalyseIA, DocumentPlainte, TypeFichier
 from shared.schemas import (
     PlainteCreate, PlainteUpdate, PlainteResponse,
     AnalyseTaskRequest, TaskStatus, PaginatedResponse, AnalyseResponse
@@ -37,6 +38,23 @@ from ..services.task_manager import trigger_analyse_plainte
 from celery_worker_v2 import trigger_plainte_analysis  # Système Celery v2
 
 logger = logging.getLogger(__name__)
+
+
+def get_type_fichier(filename: str) -> TypeFichier:
+    """Détermine le type de fichier basé sur l'extension"""
+    ext = filename.lower().split('.')[-1] if '.' in filename else ''
+    mapping = {
+        'pdf': TypeFichier.PDF,
+        'doc': TypeFichier.DOC,
+        'docx': TypeFichier.DOCX,
+        'txt': TypeFichier.TXT,
+        'jpg': TypeFichier.IMAGE,
+        'jpeg': TypeFichier.IMAGE,
+        'png': TypeFichier.IMAGE,
+        'gif': TypeFichier.IMAGE,
+        'bmp': TypeFichier.IMAGE,
+    }
+    return mapping.get(ext, TypeFichier.AUTRE)
 
 # Import du nouveau système modulaire
 try:
@@ -202,25 +220,30 @@ def get_users_for_assignment(db: Session = Depends(get_db)):
     """
     try:
         users = db.query(User).filter(
-            User.actif == True
-        ).options(
-            selectinload(User.service)
+            User.est_actif == True
         ).all()
         
-        return [
-            {
+        result = []
+        for user in users:
+            # Récupérer le service séparément si l'utilisateur a un service_id
+            service_name = None
+            if user.service_id:
+                service = db.query(Service).filter(Service.id == user.service_id).first()
+                service_name = service.nom if service else None
+            
+            result.append({
                 "id": str(user.id),
                 "nom": user.nom,
                 "prenom": user.prenom,
                 "email": user.email,
-                "service": user.service.nom if user.service else None,
+                "service": service_name,
                 "full_name": f"{user.prenom} {user.nom}"
-            }
-            for user in users
-        ]
+            })
+        
+        return result
     except Exception as e:
         logger.error(f"Erreur lors de la récupération des utilisateurs: {e}")
-        raise HTTPException(status_code=500, detail="Erreur interne du serveur")
+        raise HTTPException(status_code=500, detail=f"Erreur interne du serveur: {str(e)}")
 
 async def launch_background_analysis(plainte_id: int):
     """
@@ -409,20 +432,31 @@ async def create_new_complaint(
         
         numero_plainte = f"PL_{current_year}_{str(total_count + 1).zfill(4)}"
         
-        # Traitement des documents
-        documents_paths = []
+        # Traitement des documents - Sauvegarde sur disque
+        documents_info = []  # Liste pour stocker les infos des documents
         if documents:
             upload_dir = "data/documents"
             os.makedirs(upload_dir, exist_ok=True)
             
             for doc in documents:
                 if doc.filename:
-                    file_path = os.path.join(upload_dir, f"{numero_plainte}_{doc.filename}")
+                    nom_stockage = f"{numero_plainte}_{doc.filename}"
+                    file_path = os.path.join(upload_dir, nom_stockage)
+                    content = await doc.read()
+                    
                     with open(file_path, "wb") as buffer:
-                        content = await doc.read()
                         buffer.write(content)
-                    documents_paths.append(file_path)
-                    logger.info(f"📄 Document sauvegardé: {file_path}")
+                    
+                    # Collecter les infos pour l'enregistrement en DB
+                    documents_info.append({
+                        "nom_fichier": doc.filename,
+                        "nom_stockage": nom_stockage,
+                        "chemin_fichier": file_path,
+                        "taille_fichier": len(content),
+                        "mime_type": doc.content_type or mimetypes.guess_type(doc.filename)[0],
+                        "type_fichier": get_type_fichier(doc.filename)
+                    })
+                    logger.info(f"📄 Document sauvegardé: {file_path} ({len(content)} octets)")
         
         # Création de la plainte
         new_plainte = Plainte(
@@ -447,6 +481,30 @@ async def create_new_complaint(
         db.refresh(new_plainte)
         
         logger.info(f"✅ Plainte créée: {new_plainte.numero_plainte} (ID: {new_plainte.id})")
+        
+        # Enregistrement des documents en base de données
+        documents_saved = []
+        for doc_info in documents_info:
+            doc_record = DocumentPlainte(
+                plainte_id=new_plainte.id,
+                nom_fichier=doc_info["nom_fichier"],
+                nom_stockage=doc_info["nom_stockage"],
+                chemin_fichier=doc_info["chemin_fichier"],
+                type_fichier=doc_info["type_fichier"],
+                taille_fichier=doc_info["taille_fichier"],
+                mime_type=doc_info["mime_type"],
+                est_piece_jointe_originale=True
+            )
+            db.add(doc_record)
+            documents_saved.append({
+                "nom": doc_info["nom_fichier"],
+                "taille": doc_info["taille_fichier"],
+                "type": doc_info["type_fichier"].value
+            })
+        
+        if documents_saved:
+            db.commit()
+            logger.info(f"📁 {len(documents_saved)} document(s) enregistré(s) en base pour plainte {new_plainte.id}")
         
         # Création de l'enregistrement d'analyse IA
         analyse_ia = AnalyseIA(
@@ -476,6 +534,9 @@ async def create_new_complaint(
             "statut": new_plainte.statut.value,
             "date_creation": new_plainte.date_creation.isoformat(),
             "date_modification": new_plainte.date_modification.isoformat() if new_plainte.date_modification else None,
+            # Documents attachés
+            "documents": documents_saved,
+            "documents_count": len(documents_saved),
             # Informations sur les tâches en arrière-plan
             "task_info": {
                 "status": "plainte_created",

@@ -284,6 +284,7 @@ class Plainte(Base):
     assigned_user = relationship("User", foreign_keys=[assignee_a_id])
     analyses = relationship("Analyse", back_populates="plainte", cascade="all, delete-orphan")
     analyse_ia = relationship("AnalyseIA", back_populates="plainte", uselist=False, cascade="all, delete-orphan")
+    documents = relationship("DocumentPlainte", back_populates="plainte", cascade="all, delete-orphan")
     
     # Index pour performance
     __table_args__ = (
@@ -461,4 +462,40 @@ class AuditLog(Base):
         Index('idx_audit_user_date', 'user_id', 'date_creation'),
         Index('idx_audit_action', 'action'),
         Index('idx_audit_ressource', 'ressource_type', 'ressource_id'),
+    )
+
+
+class DocumentPlainte(Base):
+    """
+    Documents attachés aux plaintes
+    Permet de stocker les fichiers liés à chaque plainte
+    """
+    __tablename__ = "documents_plaintes"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    plainte_id = Column(BigInteger, ForeignKey("plaintes.id", ondelete="CASCADE"), nullable=False)
+    
+    # Informations du fichier
+    nom_fichier = Column(String(255), nullable=False)  # Nom original du fichier
+    nom_stockage = Column(String(500), nullable=False)  # Nom sur le disque (avec préfixe plainte)
+    chemin_fichier = Column(String(1000), nullable=False)  # Chemin complet
+    type_fichier = Column(SQLEnum(TypeFichier), default=TypeFichier.AUTRE)
+    taille_fichier = Column(BigInteger)  # Taille en octets
+    mime_type = Column(String(100))
+    
+    # Métadonnées
+    description = Column(Text)
+    est_piece_jointe_originale = Column(Boolean, default=True)  # True si uploadé avec la plainte
+    
+    # Dates
+    date_upload = Column(DateTime, nullable=False, server_default=func.now())
+    date_modification = Column(DateTime, onupdate=func.now())
+    
+    # Relations
+    plainte = relationship("Plainte", back_populates="documents")
+    
+    # Index pour performance
+    __table_args__ = (
+        Index('idx_document_plainte', 'plainte_id'),
+        Index('idx_document_type', 'type_fichier'),
     )

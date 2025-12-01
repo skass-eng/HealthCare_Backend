@@ -566,9 +566,10 @@ def get_evolution_plaintes(
 def get_statistiques_departements(db: Session = Depends(get_db)):
     """
     Récupérer les statistiques par département/service
+    Inclut tous les services, même ceux sans plaintes
     """
     try:
-        # Récupérer les statistiques par service
+        # Récupérer les statistiques par service avec LEFT JOIN pour inclure tous les services
         stats_services = db.query(
             Service.id,
             Service.nom,
@@ -579,8 +580,10 @@ def get_statistiques_departements(db: Session = Depends(get_db)):
             func.sum(case((Plainte.statut == StatutPlainte.TRAITE, 1), else_=0)).label('traitees'),
             func.sum(case((Plainte.statut == StatutPlainte.CLOTURE, 1), else_=0)).label('cloturees'),
             func.avg(Plainte.score_sentiment).label('satisfaction_moyenne')
-        ).join(
+        ).outerjoin(
             Plainte, Service.id == Plainte.service_id
+        ).filter(
+            Service.est_actif == True
         ).group_by(
             Service.id, Service.nom, Service.categorie
         ).all()
