@@ -25,7 +25,6 @@ async def get_complaints_summary(
     from_date: Optional[str] = Query(None, description="Date de début (YYYY-MM-DD)"),
     to_date: Optional[str] = Query(None, description="Date de fin (YYYY-MM-DD)"),
     status: Optional[str] = Query(None, description="Filtrer par statut"),
-    organisation_id: Optional[int] = Query(None, description="Filtrer par organisation"),
     db: Session = Depends(get_db)
 ):
     """
@@ -60,10 +59,6 @@ async def get_complaints_summary(
                 base_query = base_query.filter(Plainte.statut == statut_enum)
             except ValueError:
                 raise HTTPException(status_code=400, detail=f"Statut invalide: {status}")
-        
-        # Filtre par organisation
-        if organisation_id:
-            base_query = base_query.filter(Plainte.organisation_id == organisation_id)
         
         # 1. Nombre total de plaintes
         total = base_query.count()
@@ -116,8 +111,7 @@ async def get_complaints_summary(
             "filters_applied": {
                 "from_date": from_date,
                 "to_date": to_date,
-                "status": status,
-                "organisation_id": organisation_id
+                "status": status
             },
             "timestamp": datetime.now().isoformat()
         }
@@ -140,7 +134,6 @@ async def get_complaints_summary(
 @router.get("/complaints/trends")
 async def get_complaints_trends(
     days: int = Query(30, ge=1, le=365, description="Nombre de jours pour les tendances"),
-    organisation_id: Optional[int] = Query(None, description="Filtrer par organisation"),
     db: Session = Depends(get_db)
 ):
     """
@@ -160,10 +153,6 @@ async def get_complaints_trends(
             func.date(Plainte.date_creation) <= end_date
         )
         
-        # Filtre par organisation
-        if organisation_id:
-            base_query = base_query.filter(Plainte.organisation_id == organisation_id)
-        
         # Grouper par jour et statut
         daily_stats = db.query(
             func.date(Plainte.date_creation).label('date'),
@@ -173,9 +162,6 @@ async def get_complaints_trends(
             func.date(Plainte.date_creation) >= start_date,
             func.date(Plainte.date_creation) <= end_date
         )
-        
-        if organisation_id:
-            daily_stats = daily_stats.filter(Plainte.organisation_id == organisation_id)
         
         daily_stats = daily_stats.group_by(
             func.date(Plainte.date_creation),
@@ -218,9 +204,6 @@ async def get_complaints_trends(
                 "days": days
             },
             "trends": trends_list,
-            "filters_applied": {
-                "organisation_id": organisation_id
-            },
             "timestamp": datetime.now().isoformat()
         }
         

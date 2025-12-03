@@ -2,6 +2,7 @@
 """
 CELERY WORKER TASKS - Version Redis/Celery avec génération PDF
 Worker pour traitement automatique des plaintes avec génération PDF
+Version: 2.1.0 - Architecture ODYSSEE - PDF Robuste
 """
 
 import os
@@ -19,6 +20,16 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
+from pathlib import Path
+
+# Import du générateur PDF robuste
+try:
+    from healthcare_api_server.app.services.pdf_generator import PDFGenerator, generate_pdf_for_plainte
+    PDF_GENERATOR_AVAILABLE = True
+    print("✅ PDFGenerator robuste importé avec succès")
+except ImportError as e:
+    PDF_GENERATOR_AVAILABLE = False
+    print(f"⚠️ PDFGenerator non disponible, utilisation du mode legacy: {e}")
 
 def generate_intelligent_summary(plainte, sentiment, priorite_ia, service_suggere):
     """
@@ -207,6 +218,23 @@ app.conf.update(
 def generate_plainte_pdf(plainte_id: int):
     """
     Générer un PDF bien organisé pour une plainte
+    Utilise le générateur robuste si disponible, sinon fallback sur la méthode legacy
+    """
+    # Utiliser le générateur robuste si disponible
+    if PDF_GENERATOR_AVAILABLE:
+        try:
+            print(f"📄 Utilisation du PDFGenerator robuste pour plainte {plainte_id}")
+            return generate_pdf_for_plainte(plainte_id)
+        except Exception as e:
+            print(f"⚠️ Erreur PDFGenerator robuste, fallback legacy: {e}")
+    
+    # Fallback sur la méthode legacy
+    return _generate_pdf_legacy(plainte_id)
+
+
+def _generate_pdf_legacy(plainte_id: int):
+    """
+    Méthode legacy de génération PDF (fallback)
     Récupère toutes les informations de la base de données
     """
     db = SessionLocal()
@@ -567,6 +595,7 @@ def analyse_plainte_task(self, plainte_id: int):
 def generate_pdf_task(self, plainte_id: int):
     """
     Tâche Celery pour générer un PDF depuis la base de données
+    Robuste avec plusieurs niveaux de fallback
     """
     try:
         print(f"📄 Début génération PDF pour plainte {plainte_id}")
@@ -574,19 +603,79 @@ def generate_pdf_task(self, plainte_id: int):
         # Générer le PDF en récupérant les données de la BD
         pdf_path = generate_plainte_pdf(plainte_id)
         
-        pdf_result = {
-            'plainte_id': plainte_id,
-            'pdf_path': pdf_path,
-            'task_id': self.request.id,
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        print(f"✅ PDF généré pour plainte {plainte_id}: {pdf_path}")
-        return pdf_result
+        # Vérifier que le fichier existe
+        if pdf_path and os.path.exists(pdf_path):
+            pdf_result = {
+                'plainte_id': plainte_id,
+                'pdf_path': pdf_path,
+                'task_id': self.request.id,
+                'status': 'success',
+                'timestamp': datetime.now().isoformat()
+            }
+            print(f"✅ PDF généré pour plainte {plainte_id}: {pdf_path}")
+            return pdf_result
+        else:
+            raise Exception(f"PDF généré mais fichier introuvable: {pdf_path}")
         
     except Exception as e:
         print(f"❌ Erreur génération PDF: {e}")
-        self.retry(countdown=60, max_retries=3)
+        
+        # Tentative de génération minimale en dernier recours
+        try:
+            print(f"🔧 Tentative génération PDF minimale pour plainte {plainte_id}")
+            pdf_path = _generate_minimal_pdf_fallback(plainte_id)
+            
+            return {
+                'plainte_id': plainte_id,
+                'pdf_path': pdf_path,
+                'task_id': self.request.id,
+                'status': 'fallback_success',
+                'timestamp': datetime.now().isoformat(),
+                'note': 'PDF généré en mode fallback minimal'
+            }
+        except Exception as fallback_error:
+            print(f"❌ Échec total génération PDF: {fallback_error}")
+            self.retry(countdown=60, max_retries=3)
+
+
+def _generate_minimal_pdf_fallback(plainte_id: int):
+    """
+    Génération PDF minimale en dernier recours
+    """
+    db = SessionLocal()
+    try:
+        plainte = db.query(Plainte).filter(Plainte.id == plainte_id).first()
+        
+        # Créer le répertoire
+        pdf_dir = Path(__file__).parent / "data" / "pdf_reports"
+        pdf_dir.mkdir(parents=True, exist_ok=True)
+        
+        pdf_filename = f"plainte_{plainte_id}_rapport_complet.pdf"
+        pdf_path = pdf_dir / pdf_filename
+        
+        doc = SimpleDocTemplate(str(pdf_path), pagesize=A4)
+        styles = getSampleStyleSheet()
+        story = []
+        
+        story.append(Paragraph(f"Rapport de Plainte #{plainte_id}", styles['Title']))
+        story.append(Spacer(1, 20))
+        
+        if plainte:
+            story.append(Paragraph(f"Numéro: {plainte.numero_plainte or 'N/A'}", styles['Normal']))
+            story.append(Paragraph(f"Titre: {plainte.titre or 'N/A'}", styles['Normal']))
+            story.append(Paragraph(f"Description: {plainte.description or 'N/A'}", styles['Normal']))
+        else:
+            story.append(Paragraph("Plainte non trouvée", styles['Normal']))
+        
+        story.append(Spacer(1, 30))
+        story.append(Paragraph(f"Généré le {datetime.now().strftime('%d/%m/%Y à %H:%M')}", styles['Normal']))
+        
+        doc.build(story)
+        print(f"✅ PDF minimal généré: {pdf_path}")
+        return str(pdf_path)
+        
+    finally:
+        db.close()
 
 @app.task(bind=True)
 def process_plainte_complete(self, plainte_id: int):

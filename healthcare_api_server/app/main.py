@@ -64,20 +64,42 @@ app = FastAPI(
     redoc_url="/redoc" if settings.DEBUG else None,
 )
 
-# Configuration CORS (comme ODYSSEE)
+# Configuration CORS (comme ODYSSEE) - Doit être AVANT les autres middlewares
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.BACKEND_CORS_ORIGINS,
+    allow_origins=["*"],  # Temporairement autoriser toutes les origines
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # Middleware de logging des requêtes
 @app.middleware("http")
 async def log_requests(request, call_next):
     start_time = datetime.now()
-    response = await call_next(request)
+    
+    # Gérer les requêtes OPTIONS pour CORS preflight
+    if request.method == "OPTIONS":
+        response = JSONResponse(content={}, status_code=200)
+        response.headers["Access-Control-Allow-Origin"] = request.headers.get("origin", "*")
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        return response
+    
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        # En cas d'erreur, retourner une réponse JSON avec headers CORS
+        logger.error(f"❌ Erreur non gérée: {e}")
+        response = JSONResponse(
+            status_code=500,
+            content={"detail": str(e)}
+        )
+        response.headers["Access-Control-Allow-Origin"] = request.headers.get("origin", "*")
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+    
     process_time = (datetime.now() - start_time).total_seconds()
     
     logger.info(

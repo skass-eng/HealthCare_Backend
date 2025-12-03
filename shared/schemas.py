@@ -124,8 +124,14 @@ class PlainteUpdate(BaseModel):
     titre: Optional[str] = None
     description: Optional[str] = None
     statut: Optional[StatutPlainte] = None
+    priorite: Optional[PrioritePlainte] = None
     service_id: Optional[int] = None
     date_incident: Optional[datetime] = None
+    # Informations du plaignant
+    nom_plaignant: Optional[str] = None
+    prenom_plaignant: Optional[str] = None
+    email_plaignant: Optional[str] = None
+    telephone_plaignant: Optional[str] = None
 
 class PlainteResponse(PlainteBase, TimestampMixin):
     """Réponse plainte complète (comme dashboard ODYSSEE avec widgets)"""
@@ -146,6 +152,12 @@ class PlainteResponse(PlainteBase, TimestampMixin):
     
     # Métadonnées d'analyse IA
     analyse_ia: Dict[str, Any] = Field(default_factory=dict)
+    
+    # Informations du plaignant
+    nom_plaignant: Optional[str] = None
+    prenom_plaignant: Optional[str] = None
+    email_plaignant: Optional[str] = None
+    telephone_plaignant: Optional[str] = None
     
     # Dates
     date_limite_reponse: Optional[datetime] = None
@@ -209,6 +221,27 @@ class AnalyseTaskRequest(BaseModel):
     types_analyse: List[str] = Field(default_factory=list)  # Chaînes au lieu d'enums
     parametres: Dict[str, Any] = Field(default_factory=dict)
     priorite_task: str = "normal"  # high, normal, low
+
+# ==================== SCHÉMAS DOCUMENT ====================
+
+class DocumentPlainteBase(BaseModel):
+    """Document attaché à une plainte"""
+    nom_fichier: str
+    type_fichier: Optional[TypeFichier] = TypeFichier.AUTRE
+    description: Optional[str] = None
+
+class DocumentPlainteResponse(DocumentPlainteBase):
+    """Réponse document avec infos complètes"""
+    id: int
+    plainte_id: int
+    nom_stockage: str
+    chemin_fichier: str
+    taille_fichier: Optional[int] = None
+    mime_type: Optional[str] = None
+    est_piece_jointe_originale: bool = True
+    date_upload: datetime
+    
+    model_config = ConfigDict(from_attributes=True)
 
 class AnalyseTaskResult(BaseModel):
     """Résultat de tâche d'analyse (comme les résultats de widgets ODYSSEE)"""

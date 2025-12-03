@@ -6,6 +6,9 @@ Configuration Celery pour l'architecture modulaire
 broker_url = 'redis://localhost:6379/1'
 result_backend = 'redis://localhost:6379/2'
 
+# Configuration de connexion au broker
+broker_connection_retry_on_startup = True
+
 # Configuration des tâches
 task_serializer = 'json'
 accept_content = ['json']

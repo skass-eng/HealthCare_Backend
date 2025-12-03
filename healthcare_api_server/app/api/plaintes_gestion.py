@@ -7,18 +7,21 @@ Version: 1.0.0 - Architecture ODYSSEE
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import and_, or_, desc, func, case
 from typing import List, Optional
 from uuid import UUID
 import logging
 from datetime import datetime, timedelta
+from pathlib import Path
+import os
 
 from ..db.database import get_db
-from shared.models import Plainte, User, Service, Analyse, StatutPlainte
+from shared.models import Plainte, User, Service, Analyse, StatutPlainte, DocumentPlainte, AnalyseIA
 from shared.schemas import (
     PlainteCreate, PlainteUpdate, PlainteResponse,
-    AnalyseTaskRequest, TaskStatus, PaginatedResponse, AnalyseResponse
+    AnalyseTaskRequest, TaskStatus, PaginatedResponse, AnalyseResponse, DocumentPlainteResponse
 )
 # from ..core.auth import get_current_user  # Désactivé pour le développement
 from ..services.task_manager import trigger_analyse_plainte
@@ -257,37 +260,126 @@ async def export_plaintes(
         logger.error(f"❌ Erreur lors de l'export des plaintes: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/{plainte_id}", response_model=PlainteResponse)
+@router.get("/{plainte_id}")
 def get_plainte(plainte_id: int, db: Session = Depends(get_db)):
     """
-    Récupérer une plainte spécifique par son ID
+    Récupérer une plainte spécifique par son ID avec tous les documents et l'analyse IA
     """
     try:
         plainte = db.query(Plainte).options(
             selectinload(Plainte.service),
             selectinload(Plainte.assigned_user),
-            selectinload(Plainte.analyses)
+            selectinload(Plainte.analyses),
+            selectinload(Plainte.documents),
+            selectinload(Plainte.analyse_ia)
         ).filter(Plainte.id == plainte_id).first()
 
         if not plainte:
             raise HTTPException(status_code=404, detail="Plainte non trouvée")
 
-        return PlainteResponse(
-            id=plainte.id,
-            titre=plainte.titre,
-            contenu=plainte.contenu,
-            nom_plaignant=plainte.nom_plaignant,
-            prenom_plaignant=plainte.prenom_plaignant,
-            email_plaignant=plainte.email_plaignant,
-            telephone_plaignant=plainte.telephone_plaignant,
-            mode_reception=plainte.mode_reception,
-            statut=plainte.statut,
-            date_creation=plainte.date_creation,
-            date_mise_a_jour=plainte.date_mise_a_jour,
-            service=plainte.service,
-            assigned_user=plainte.assigned_user,
-            analyses=plainte.analyses or []
-        )
+        # Préparer les documents pour la réponse
+        documents_data = []
+        for doc in (plainte.documents or []):
+            documents_data.append({
+                "id": doc.id,
+                "plainte_id": doc.plainte_id,
+                "nom_fichier": doc.nom_fichier,
+                "nom_stockage": doc.nom_stockage,
+                "chemin_fichier": doc.chemin_fichier,
+                "type_fichier": doc.type_fichier.value if doc.type_fichier else "AUTRE",
+                "taille_fichier": doc.taille_fichier,
+                "mime_type": doc.mime_type,
+                "est_piece_jointe_originale": doc.est_piece_jointe_originale,
+                "date_upload": doc.date_upload.isoformat() if doc.date_upload else None
+            })
+
+        # Préparer l'analyse IA si disponible
+        analyse_ia_data = None
+        if plainte.analyse_ia:
+            ai = plainte.analyse_ia
+            analyse_ia_data = {
+                "id": ai.id,
+                "sentiment": ai.sentiment,
+                "score_sentiment": ai.score_sentiment,
+                "service_suggere": ai.service_suggere,
+                "priorite_ia": ai.priorite_ia,
+                "resume_ia": ai.resume_ia,
+                "reponse_suggeree": ai.reponse_suggeree,
+                "mots_cles_detectes": ai.mots_cles_detectes,
+                "statut_analyse": ai.statut_analyse,
+                "date_analyse": ai.date_analyse.isoformat() if ai.date_analyse else None
+            }
+
+        # Chercher le PDF rapport généré - plusieurs chemins possibles
+        pdf_rapport = None
+        
+        # Chemin 1: Relatif au fichier actuel (healthcare_api_server/app/api/)
+        pdf_dir_1 = Path(__file__).parent.parent.parent.parent / "data" / "pdf_reports"
+        
+        # Chemin 2: Relatif au répertoire de travail courant (HealthCare_Backend/)
+        pdf_dir_2 = Path("data/pdf_reports")
+        
+        # Chemin 3: Chemin absolu basé sur le projet
+        pdf_dir_3 = Path(__file__).resolve().parent.parent.parent.parent / "data" / "pdf_reports"
+        
+        # Essayer tous les chemins possibles
+        for pdf_dir in [pdf_dir_1, pdf_dir_2, pdf_dir_3]:
+            if pdf_dir.exists():
+                logger.info(f"📂 Recherche PDF dans: {pdf_dir}")
+                for pdf_file in pdf_dir.glob(f"plainte_{plainte_id}_*.pdf"):
+                    pdf_rapport = {
+                        "nom_fichier": pdf_file.name,
+                        "chemin": str(pdf_file.resolve()),
+                        "type": "PDF_RAPPORT",
+                        "taille": pdf_file.stat().st_size,
+                        "date_creation": datetime.fromtimestamp(pdf_file.stat().st_mtime).isoformat()
+                    }
+                    logger.info(f"✅ PDF trouvé: {pdf_file.name}")
+                    break
+            if pdf_rapport:
+                break
+
+        return {
+            "id": plainte.id,
+            "numero_plainte": plainte.numero_plainte,
+            "titre": plainte.titre,
+            "description": plainte.description,
+            "contenu": getattr(plainte, 'contenu', plainte.description),
+            "nom_plaignant": plainte.nom_plaignant,
+            "prenom_plaignant": plainte.prenom_plaignant,
+            "email_plaignant": plainte.email_plaignant,
+            "telephone_plaignant": plainte.telephone_plaignant,
+            "mode_reception": plainte.mode_reception,
+            "statut": plainte.statut.value if plainte.statut else "RECU",
+            "priorite": plainte.priorite.value if plainte.priorite else "MOYEN",
+            "categorie_principale": plainte.categorie_principale,
+            "date_incident": plainte.date_incident.isoformat() if plainte.date_incident else None,
+            "date_creation": plainte.date_creation.isoformat() if plainte.date_creation else None,
+            "date_modification": plainte.date_modification.isoformat() if plainte.date_modification else None,
+            "service_id": plainte.service_id,
+            "service": {
+                "id": plainte.service.id,
+                "nom": plainte.service.nom,
+                "code_service": plainte.service.code_service
+            } if plainte.service else None,
+            "assigned_user": {
+                "id": plainte.assigned_user.id,
+                "nom": plainte.assigned_user.nom,
+                "prenom": plainte.assigned_user.prenom,
+                "email": plainte.assigned_user.email
+            } if plainte.assigned_user else None,
+            "documents": documents_data,
+            "pdf_rapport": pdf_rapport,
+            "analyse_ia": analyse_ia_data,
+            "analyses": [
+                {
+                    "id": a.id,
+                    "type_analyse": a.type_analyse.value if a.type_analyse else None,
+                    "statut": a.statut.value if a.statut else None,
+                    "resultats": a.resultats
+                } for a in (plainte.analyses or [])
+            ]
+        }
 
     except HTTPException:
         raise
@@ -295,7 +387,157 @@ def get_plainte(plainte_id: int, db: Session = Depends(get_db)):
         logger.error(f"❌ Erreur lors de la récupération de la plainte {plainte_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.put("/{plainte_id}", response_model=PlainteResponse)
+@router.get("/{plainte_id}/documents")
+def get_plainte_documents(plainte_id: int, db: Session = Depends(get_db)):
+    """
+    Récupérer tous les documents d'une plainte spécifique
+    """
+    try:
+        # Vérifier que la plainte existe
+        plainte = db.query(Plainte).filter(Plainte.id == plainte_id).first()
+        if not plainte:
+            raise HTTPException(status_code=404, detail="Plainte non trouvée")
+
+        # Récupérer les documents de la base de données
+        documents = db.query(DocumentPlainte).filter(
+            DocumentPlainte.plainte_id == plainte_id
+        ).all()
+
+        documents_data = []
+        for doc in documents:
+            # Vérifier si le fichier existe physiquement
+            fichier_existe = os.path.exists(doc.chemin_fichier) if doc.chemin_fichier else False
+            
+            documents_data.append({
+                "id": doc.id,
+                "plainte_id": doc.plainte_id,
+                "nom_fichier": doc.nom_fichier,
+                "nom_stockage": doc.nom_stockage,
+                "chemin_fichier": doc.chemin_fichier,
+                "type_fichier": doc.type_fichier.value if doc.type_fichier else "AUTRE",
+                "taille_fichier": doc.taille_fichier,
+                "mime_type": doc.mime_type,
+                "est_piece_jointe_originale": doc.est_piece_jointe_originale,
+                "date_upload": doc.date_upload.isoformat() if doc.date_upload else None,
+                "fichier_existe": fichier_existe
+            })
+
+        # Chercher aussi le PDF rapport généré - plusieurs chemins possibles
+        pdf_rapport = None
+        
+        # Chemin 1: Relatif au fichier actuel
+        pdf_dir_1 = Path(__file__).parent.parent.parent.parent / "data" / "pdf_reports"
+        
+        # Chemin 2: Relatif au répertoire de travail courant
+        pdf_dir_2 = Path("data/pdf_reports")
+        
+        # Chemin 3: Chemin absolu résolu
+        pdf_dir_3 = Path(__file__).resolve().parent.parent.parent.parent / "data" / "pdf_reports"
+        
+        # Essayer tous les chemins possibles
+        for pdf_dir in [pdf_dir_1, pdf_dir_2, pdf_dir_3]:
+            if pdf_dir.exists():
+                for pdf_file in pdf_dir.glob(f"plainte_{plainte_id}_*.pdf"):
+                    pdf_rapport = {
+                        "nom_fichier": pdf_file.name,
+                        "chemin": str(pdf_file.resolve()),
+                        "type": "PDF_RAPPORT",
+                        "taille": pdf_file.stat().st_size,
+                        "date_creation": datetime.fromtimestamp(pdf_file.stat().st_mtime).isoformat()
+                    }
+                    break
+            if pdf_rapport:
+                break
+
+        return {
+            "plainte_id": plainte_id,
+            "documents": documents_data,
+            "pdf_rapport": pdf_rapport,
+            "total_documents": len(documents_data)
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erreur lors de la récupération des documents de la plainte {plainte_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/{plainte_id}/documents/{document_id}/download")
+def download_document(plainte_id: int, document_id: int, db: Session = Depends(get_db)):
+    """
+    Télécharger un document spécifique d'une plainte
+    """
+    try:
+        document = db.query(DocumentPlainte).filter(
+            DocumentPlainte.id == document_id,
+            DocumentPlainte.plainte_id == plainte_id
+        ).first()
+
+        if not document:
+            raise HTTPException(status_code=404, detail="Document non trouvé")
+
+        if not os.path.exists(document.chemin_fichier):
+            raise HTTPException(status_code=404, detail="Fichier non trouvé sur le serveur")
+
+        return FileResponse(
+            path=document.chemin_fichier,
+            filename=document.nom_fichier,
+            media_type=document.mime_type or "application/octet-stream"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erreur lors du téléchargement du document {document_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/{plainte_id}/pdf-rapport/download")
+def download_pdf_rapport(plainte_id: int, db: Session = Depends(get_db)):
+    """
+    Télécharger le PDF rapport généré pour une plainte
+    """
+    try:
+        # Vérifier que la plainte existe
+        plainte = db.query(Plainte).filter(Plainte.id == plainte_id).first()
+        if not plainte:
+            raise HTTPException(status_code=404, detail="Plainte non trouvée")
+
+        # Chercher le PDF rapport - plusieurs chemins possibles
+        pdf_file = None
+        
+        # Chemin 1: Relatif au fichier actuel
+        pdf_dir_1 = Path(__file__).parent.parent.parent.parent / "data" / "pdf_reports"
+        
+        # Chemin 2: Relatif au répertoire de travail courant
+        pdf_dir_2 = Path("data/pdf_reports")
+        
+        # Chemin 3: Chemin absolu résolu
+        pdf_dir_3 = Path(__file__).resolve().parent.parent.parent.parent / "data" / "pdf_reports"
+        
+        for pdf_dir in [pdf_dir_1, pdf_dir_2, pdf_dir_3]:
+            if pdf_dir.exists():
+                for f in pdf_dir.glob(f"plainte_{plainte_id}_*.pdf"):
+                    pdf_file = f
+                    break
+            if pdf_file:
+                break
+
+        if not pdf_file or not pdf_file.exists():
+            raise HTTPException(status_code=404, detail="Rapport PDF non trouvé")
+
+        return FileResponse(
+            path=str(pdf_file.resolve()),
+            filename=pdf_file.name,
+            media_type="application/pdf"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erreur lors du téléchargement du rapport PDF de la plainte {plainte_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.put("/{plainte_id}")
 async def update_plainte(
     plainte_id: int,
     plainte_data: PlainteUpdate,
@@ -317,7 +559,7 @@ async def update_plainte(
             if hasattr(plainte, field):
                 setattr(plainte, field, value)
 
-        plainte.date_mise_a_jour = datetime.now()
+        plainte.date_modification = datetime.now()
         
         db.commit()
         db.refresh(plainte)
@@ -331,22 +573,26 @@ async def update_plainte(
 
         logger.info(f"✅ Plainte mise à jour: ID={plainte_id}")
 
-        return PlainteResponse(
-            id=plainte_updated.id,
-            titre=plainte_updated.titre,
-            contenu=plainte_updated.contenu,
-            nom_plaignant=plainte_updated.nom_plaignant,
-            prenom_plaignant=plainte_updated.prenom_plaignant,
-            email_plaignant=plainte_updated.email_plaignant,
-            telephone_plaignant=plainte_updated.telephone_plaignant,
-            mode_reception=plainte_updated.mode_reception,
-            statut=plainte_updated.statut,
-            date_creation=plainte_updated.date_creation,
-            date_mise_a_jour=plainte_updated.date_mise_a_jour,
-            service=plainte_updated.service,
-            assigned_user=plainte_updated.assigned_user,
-            analyses=plainte_updated.analyses or []
-        )
+        # Retourner un dictionnaire simple pour éviter les problèmes de schéma
+        return {
+            "id": plainte_updated.id,
+            "numero_plainte": plainte_updated.numero_plainte,
+            "titre": plainte_updated.titre,
+            "description": plainte_updated.description,
+            "nom_plaignant": plainte_updated.nom_plaignant,
+            "prenom_plaignant": plainte_updated.prenom_plaignant,
+            "email_plaignant": plainte_updated.email_plaignant,
+            "telephone_plaignant": plainte_updated.telephone_plaignant,
+            "mode_reception": plainte_updated.mode_reception,
+            "statut": plainte_updated.statut.value if plainte_updated.statut else "RECU",
+            "priorite": plainte_updated.priorite.value if plainte_updated.priorite else "MOYEN",
+            "date_creation": plainte_updated.date_creation.isoformat() if plainte_updated.date_creation else None,
+            "date_modification": plainte_updated.date_modification.isoformat() if plainte_updated.date_modification else None,
+            "service": {
+                "id": plainte_updated.service.id,
+                "nom": plainte_updated.service.nom
+            } if plainte_updated.service else None
+        }
 
     except HTTPException:
         raise
