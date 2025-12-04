@@ -11,7 +11,6 @@ from datetime import datetime
 # Ajouter le répertoire parent au path pour les imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from celery import Celery
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 import json
@@ -20,7 +19,7 @@ import json
 from healthcare_worker_server.app.services.document_parser import DocumentParserService
 from healthcare_worker_server.app.services.complaint_analysis import ComplaintAnalysisService
 from healthcare_worker_server.app.services.pdf_generator import PDFReportService
-from healthcare_worker_server.app.services.llm_provider import LLMProvider
+from healthcare_worker_server.app.services.llm_provider import get_llm_service
 from healthcare_worker_server.app.tasks.workflow_orchestrator import ComplaintWorkflowOrchestrator
 
 # Configuration du logging
@@ -30,9 +29,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configuration Celery
-app = Celery('healthcare_worker')
-app.config_from_object('celery_config')
+# Import de l'app Celery depuis celery_worker_v2 pour utiliser la même instance
+from celery_worker_v2 import app
 
 # Configuration de la base de données
 DATABASE_URL = "postgresql://daniel:Gse45Dk78p@localhost/healthcare_db"
@@ -59,8 +57,8 @@ def initialize_services():
         # Service de parsing de documents
         _document_parser = DocumentParserService()
         
-        # Service LLM (simulation)
-        llm_provider = LLMProvider()
+        # Service LLM (utiliser le singleton)
+        llm_provider = get_llm_service()
         
         # Service d'analyse IA
         _analysis_service = ComplaintAnalysisService(llm_provider)
@@ -512,6 +510,215 @@ def get_all_analysis_results(plainte_id: int) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Erreur lors de la récupération des analyses: {str(e)}")
         return {}
+
+
+# ===== NOUVELLE TÂCHE: Extraction de données PDF asynchrone =====
+
+def notify_websocket(event_type: str, data: Dict[str, Any]):
+    """
+    Envoie une notification via Redis pub/sub pour le WebSocket
+    Le serveur FastAPI écoute ce canal et transmet aux clients connectés
+    """
+    try:
+        import redis
+        r = redis.Redis(host='localhost', port=6379, db=0)
+        
+        message = json.dumps({
+            "event": event_type,
+            "data": data,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        r.publish('websocket_notifications', message)
+        logger.info(f"📡 Notification WebSocket envoyée: {event_type}")
+    except Exception as e:
+        logger.warning(f"⚠️ Impossible d'envoyer la notification WebSocket: {e}")
+
+
+@app.task(bind=True, name="extract_pdf_data_async")
+def extract_pdf_data_async(self, task_id: str, pdf_text: str, filename: str):
+    """
+    Tâche asynchrone pour extraire les données d'un PDF via IA.
+    Envoie le résultat via WebSocket quand terminé.
+    
+    Args:
+        task_id: Identifiant unique de la tâche (pour le frontend)
+        pdf_text: Texte extrait du PDF
+        filename: Nom du fichier original
+    
+    Returns:
+        Dict avec les données extraites
+    """
+    logger.info(f"🔬 [Task {task_id}] Démarrage extraction PDF async: {filename}")
+    
+    # Notifier le début du traitement
+    notify_websocket("pdf_extraction_started", {
+        "task_id": task_id,
+        "filename": filename,
+        "status": "processing",
+        "message": "Analyse IA en cours..."
+    })
+    
+    try:
+        # Initialiser les services
+        initialize_services()
+        
+        # Extraire les données avec le service d'analyse IA
+        logger.info(f"🤖 [Task {task_id}] Appel du service d'analyse IA...")
+        extraction_result = _analysis_service.extract_complaint_data_from_pdf(pdf_text)
+        
+        if extraction_result.success:
+            # Parser le contenu JSON
+            try:
+                extracted_data = json.loads(extraction_result.content)
+            except json.JSONDecodeError:
+                extracted_data = {"raw_content": extraction_result.content}
+            
+            result = {
+                "success": True,
+                "task_id": task_id,
+                "filename": filename,
+                "extraction": {
+                    "donnees_structurees": extracted_data,
+                    "texte_brut": pdf_text[:2000],  # Limiter la taille
+                    "texte_longueur": len(pdf_text)
+                },
+                "confidence": extraction_result.confidence,
+                "message": "Extraction réussie"
+            }
+            
+            logger.info(f"✅ [Task {task_id}] Extraction réussie avec confiance {extraction_result.confidence}")
+            
+            # Notifier le succès via WebSocket
+            notify_websocket("pdf_extraction_complete", result)
+            
+            return result
+        else:
+            error_result = {
+                "success": False,
+                "task_id": task_id,
+                "filename": filename,
+                "error": extraction_result.error or "Erreur d'extraction inconnue",
+                "message": "Échec de l'extraction"
+            }
+            
+            logger.error(f"❌ [Task {task_id}] Échec extraction: {extraction_result.error}")
+            
+            # Notifier l'échec via WebSocket
+            notify_websocket("pdf_extraction_failed", error_result)
+            
+            return error_result
+            
+    except Exception as e:
+        error_msg = f"Erreur lors de l'extraction PDF: {str(e)}"
+        logger.error(f"❌ [Task {task_id}] {error_msg}")
+        
+        error_result = {
+            "success": False,
+            "task_id": task_id,
+            "filename": filename,
+            "error": error_msg,
+            "message": "Erreur interne"
+        }
+        
+        # Notifier l'erreur via WebSocket
+        notify_websocket("pdf_extraction_failed", error_result)
+        
+        return error_result
+
+
+@app.task(bind=True, name="extract_image_data_async")
+def extract_image_data_async(self, task_id: str, image_path: str, filename: str):
+    """
+    Tâche asynchrone pour extraire les données d'une image via OCR + IA.
+    
+    Args:
+        task_id: Identifiant unique de la tâche
+        image_path: Chemin vers l'image temporaire
+        filename: Nom du fichier original
+    """
+    logger.info(f"📷 [Task {task_id}] Démarrage extraction image async: {filename}")
+    
+    # Notifier le début du traitement
+    notify_websocket("image_extraction_started", {
+        "task_id": task_id,
+        "filename": filename,
+        "status": "processing",
+        "message": "OCR et analyse IA en cours..."
+    })
+    
+    try:
+        initialize_services()
+        
+        # Importer le service OCR
+        from healthcare_worker_server.app.services.image_ocr import ImageOCRService
+        ocr_service = ImageOCRService()
+        
+        # 1. Extraire le texte via OCR
+        logger.info(f"🔍 [Task {task_id}] Extraction OCR...")
+        ocr_result = ocr_service.extract_text_from_image(image_path)
+        
+        if not ocr_result.get("success"):
+            raise Exception(ocr_result.get("error", "Échec OCR"))
+        
+        ocr_text = ocr_result.get("text", "")
+        ocr_confidence = ocr_result.get("confidence", 0)
+        
+        # 2. Analyser avec IA
+        logger.info(f"🤖 [Task {task_id}] Analyse IA du texte OCR...")
+        extraction_result = _analysis_service.extract_complaint_data_from_pdf(ocr_text)
+        
+        if extraction_result.success:
+            try:
+                extracted_data = json.loads(extraction_result.content)
+            except json.JSONDecodeError:
+                extracted_data = {"raw_content": extraction_result.content}
+            
+            result = {
+                "success": True,
+                "task_id": task_id,
+                "filename": filename,
+                "extraction": {
+                    "donnees_structurees": extracted_data,
+                    "texte_brut": ocr_text[:2000],
+                    "texte_longueur": len(ocr_text)
+                },
+                "ocr_info": {
+                    "confiance": ocr_confidence,
+                    "qualite": ocr_result.get("quality", "unknown")
+                },
+                "confidence": extraction_result.confidence,
+                "message": "Extraction réussie"
+            }
+            
+            logger.info(f"✅ [Task {task_id}] Extraction image réussie")
+            notify_websocket("image_extraction_complete", result)
+            
+            return result
+        else:
+            raise Exception(extraction_result.error or "Échec analyse IA")
+            
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"❌ [Task {task_id}] Erreur: {error_msg}")
+        
+        error_result = {
+            "success": False,
+            "task_id": task_id,
+            "filename": filename,
+            "error": error_msg
+        }
+        
+        notify_websocket("image_extraction_failed", error_result)
+        return error_result
+    finally:
+        # Nettoyer le fichier temporaire
+        try:
+            if os.path.exists(image_path):
+                os.remove(image_path)
+        except:
+            pass
+
 
 if __name__ == '__main__':
     logger.info("🚀 Démarrage du worker Celery modulaire")

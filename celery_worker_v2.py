@@ -199,11 +199,14 @@ app.conf.update(
     worker_prefetch_multiplier=1,
     task_time_limit=300,  # 5 minutes max
     task_soft_time_limit=240,  # 4 minutes soft limit
+    # Import des tâches modulaires (celery_tasks.py)
+    imports=['healthcare_worker_server.app.tasks.celery_tasks'],
     # Configuration du routing pour compatibilité avec les queues existantes
     task_routes={
         'celery_worker_v2.process_plainte_complete': {'queue': 'celery'},
         'celery_worker_v2.analyse_plainte_task': {'queue': 'analyses'},
         'celery_worker_v2.generate_pdf_task': {'queue': 'celery'},
+        'process_complaint_complete': {'queue': 'celery'},  # Tâche modulaire
     },
     # Queues disponibles
     task_default_queue='celery',

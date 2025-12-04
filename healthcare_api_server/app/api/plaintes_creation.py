@@ -37,6 +37,22 @@ from ..services.task_manager import trigger_analyse_plainte
 # from ..services.worker_tasks import trigger_analyse_plainte_complete  # Ancien système simulé
 from celery_worker_v2 import trigger_plainte_analysis  # Système Celery v2
 
+# Import des services d'extraction PDF et analyse
+try:
+    from healthcare_worker_server.app.services.document_parser import DocumentParserService
+    from healthcare_worker_server.app.services.complaint_analysis import ComplaintAnalysisService
+    from healthcare_worker_server.app.services.llm_provider import get_llm_service
+    PDF_EXTRACTION_AVAILABLE = True
+except ImportError:
+    PDF_EXTRACTION_AVAILABLE = False
+
+# Import du service OCR pour les images
+try:
+    from healthcare_worker_server.app.services.image_ocr import ImageOCRService, get_ocr_service
+    IMAGE_OCR_AVAILABLE = True
+except ImportError:
+    IMAGE_OCR_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -765,3 +781,1263 @@ def get_analysis_status(
     except Exception as e:
         logger.error(f"Erreur lors de la récupération du statut d'analyse: {e}")
         raise HTTPException(status_code=500, detail=f"Erreur interne du serveur: {str(e)}")
+
+
+# ==================== CRÉATION DEPUIS UN PDF ====================
+
+def _extract_basic_data_from_text(text: str) -> dict:
+    """
+    Extraction basique de données depuis le texte du PDF (fallback sans LLM).
+    Utilise des expressions régulières pour extraire les informations courantes.
+    """
+    import re
+    
+    # Patterns de base
+    email_pattern = r'[\w\.-]+@[\w\.-]+\.\w+'
+    phone_pattern = r'(?:0|\+33)[1-9](?:[\s.-]?\d{2}){4}'
+    date_pattern = r'(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})'
+    
+    # Extraction email
+    emails = re.findall(email_pattern, text)
+    email = emails[0] if emails else None
+    
+    # Extraction téléphone
+    phones = re.findall(phone_pattern, text)
+    telephone = phones[0].replace(" ", "").replace(".", "").replace("-", "") if phones else None
+    
+    # Extraction date
+    dates = re.findall(date_pattern, text)
+    date_incident = None
+    if dates:
+        day, month, year = dates[0]
+        if len(year) == 2:
+            year = "20" + year
+        date_incident = f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+    
+    # Extraction nom/prénom
+    name_patterns = [
+        r'(?:Madame|Mme\.?)\s+([A-ZÉÈÊËÀÂÄÙÛÜa-zéèêëàâäùûü]+)\s+([A-ZÉÈÊËÀÂÄÙÛÜ]+)',
+        r'(?:Monsieur|Mr?\.?)\s+([A-ZÉÈÊËÀÂÄÙÛÜa-zéèêëàâäùûü]+)\s+([A-ZÉÈÊËÀÂÄÙÛÜ]+)',
+        r'(?:Nom|NOM)\s*[:\s]+([A-ZÉÈÊËÀÂÄÙÛÜ][a-zéèêëàâäùûü]+)',
+        r'(?:Prénom|PRENOM)\s*[:\s]+([A-ZÉÈÊËÀÂÄÙÛÜ][a-zéèêëàâäùûü]+)',
+    ]
+    
+    prenom = None
+    nom = None
+    for pattern in name_patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        if matches:
+            if isinstance(matches[0], tuple):
+                prenom, nom = matches[0]
+            else:
+                nom = matches[0]
+            break
+    
+    # Extraction du titre/objet
+    titre = None
+    objet_match = re.search(r'(?:Objet|OBJET)\s*[:\s]+(.+?)(?:\n|$)', text)
+    if objet_match:
+        titre = objet_match.group(1).strip()[:100]
+    else:
+        # Prendre les premiers mots significatifs
+        lines = text.split('\n')
+        for line in lines:
+            line = line.strip()
+            if len(line) > 20 and not re.match(r'^[\d\s\-\/\.]+$', line):
+                titre = line[:100]
+                break
+    
+    # Extraire une description (premiers paragraphes significatifs)
+    description = ""
+    paragraphs = text.split('\n\n')
+    for p in paragraphs:
+        p = p.strip()
+        if len(p) > 50:
+            description = p[:1000]
+            break
+    
+    if not description:
+        description = text[:1000] if text else "Plainte importée depuis PDF"
+    
+    logger.info(f"📝 Extraction basique: nom={nom}, prenom={prenom}, email={email}, tel={telephone}")
+    
+    return {
+        "plaignant": {
+            "nom": nom,
+            "prenom": prenom,
+            "email": email,
+            "telephone": telephone
+        },
+        "plainte": {
+            "titre": titre or "Plainte importée depuis PDF",
+            "description": description,
+            "date_incident": date_incident,
+            "service_concerne": None,
+            "mode_reception": "pdf_import"
+        },
+        "analyse": {
+            "priorite_suggeree": "MOYEN",
+            "mots_cles": [],
+            "gravite_estimee": "non déterminée",
+            "resume_court": "Plainte importée depuis un document PDF."
+        },
+        "confiance_extraction": {
+            "score_global": 0.5,
+            "champs_incertains": ["nom", "prenom", "date_incident", "service_concerne"]
+        }
+    }
+
+
+@router.post("/depuis-donnees-validees")
+async def create_complaint_from_validated_data(
+    background_tasks: BackgroundTasks,
+    pdf_file: UploadFile = File(..., description="Fichier PDF à rattacher à la plainte"),
+    service_id: int = Form(..., description="ID du service"),
+    # Données validées par l'utilisateur (obligatoires)
+    titre: str = Form(..., description="Titre de la plainte (validé par l'utilisateur)"),
+    description: str = Form(..., description="Description de la plainte (validée par l'utilisateur)"),
+    nom_plaignant: str = Form(..., description="Nom du plaignant (validé par l'utilisateur)"),
+    prenom_plaignant: str = Form(..., description="Prénom du plaignant (validé par l'utilisateur)"),
+    # Données optionnelles
+    email_plaignant: Optional[str] = Form(None, description="Email du plaignant"),
+    telephone_plaignant: Optional[str] = Form(None, description="Téléphone du plaignant"),
+    mode_reception: Optional[str] = Form("pdf_import", description="Mode de réception"),
+    date_incident: Optional[str] = Form(None, description="Date de l'incident (YYYY-MM-DD)"),
+    priorite: Optional[str] = Form("MOYEN", description="Priorité de la plainte"),
+    assigned_user_id: Optional[int] = Form(None, description="ID de l'utilisateur assigné"),
+    db: Session = Depends(get_db)
+):
+    """
+    Créer une nouvelle plainte avec les données VALIDÉES par l'utilisateur.
+    
+    Cette route est optimisée pour être utilisée APRÈS la prévisualisation.
+    Elle ne refait PAS l'analyse IA - elle utilise directement les données validées.
+    
+    Processus:
+    1. Validation des données obligatoires
+    2. Upload et stockage du PDF original
+    3. Création directe de la plainte en BDD
+    4. Rattachement du PDF à la plainte
+    5. Lancement de l'analyse IA en arrière-plan (optionnel)
+    
+    Returns:
+        La plainte créée avec le document attaché
+    """
+    try:
+        logger.info(f"📄 Création plainte depuis données validées - PDF: {pdf_file.filename}")
+        logger.info(f"📝 Données: titre={titre[:50]}..., nom={nom_plaignant}, prenom={prenom_plaignant}, service={service_id}")
+        
+        # Vérification du type de fichier
+        if not pdf_file.filename.lower().endswith('.pdf'):
+            raise HTTPException(status_code=400, detail="Seuls les fichiers PDF sont acceptés")
+        
+        # Lecture et vérification de la taille
+        content = await pdf_file.read()
+        if len(content) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="Le fichier PDF ne doit pas dépasser 10 MB")
+        
+        # Vérifier que le service existe
+        service = db.query(Service).filter(Service.id == service_id).first()
+        if not service:
+            raise HTTPException(status_code=404, detail=f"Service ID {service_id} non trouvé")
+        
+        # Génération du numéro de plainte
+        current_year = datetime.now().year
+        total_count = db.query(func.count(Plainte.id)).filter(
+            func.extract('year', Plainte.date_creation) == current_year
+        ).scalar() or 0
+        numero_plainte = f"PL_{current_year}_{str(total_count + 1).zfill(4)}"
+        
+        # Sauvegarde du PDF original
+        upload_dir = Path("data/documents/pdf_originaux")
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        
+        nom_stockage = f"{numero_plainte}_{pdf_file.filename}"
+        file_path = upload_dir / nom_stockage
+        
+        with open(file_path, "wb") as buffer:
+            buffer.write(content)
+        
+        logger.info(f"📁 PDF sauvegardé: {file_path} ({len(content)} octets)")
+        
+        # Conversion de la priorité
+        try:
+            priorite_enum = PrioritePlainte(priorite) if priorite else PrioritePlainte.MOYEN
+        except ValueError:
+            priorite_enum = PrioritePlainte.MOYEN
+        
+        # Conversion de la date d'incident
+        date_incident_parsed = None
+        if date_incident:
+            try:
+                date_incident_parsed = datetime.strptime(date_incident, "%Y-%m-%d").date()
+            except ValueError:
+                pass
+        
+        # Création de la plainte avec les données validées
+        new_plainte = Plainte(
+            numero_plainte=numero_plainte,
+            titre=titre[:500],
+            description=description,
+            nom_plaignant=nom_plaignant,
+            prenom_plaignant=prenom_plaignant,
+            email_plaignant=email_plaignant,
+            telephone_plaignant=telephone_plaignant,
+            mode_reception=mode_reception or "pdf_import",
+            service_id=service_id,
+            priorite=priorite_enum,
+            statut=StatutPlainte.RECU,
+            date_incident=date_incident_parsed,
+            date_creation=datetime.now(),
+            date_modification=datetime.now(),
+            assigned_user_id=assigned_user_id
+        )
+        
+        db.add(new_plainte)
+        db.commit()
+        db.refresh(new_plainte)
+        
+        logger.info(f"✅ Plainte créée: {new_plainte.numero_plainte} (ID: {new_plainte.id})")
+        
+        # Enregistrement du document PDF
+        doc_record = DocumentPlainte(
+            plainte_id=new_plainte.id,
+            nom_fichier=pdf_file.filename,
+            nom_stockage=nom_stockage,
+            chemin_fichier=str(file_path),
+            type_fichier=TypeFichier.PDF,
+            taille_fichier=len(content),
+            mime_type="application/pdf",
+            description="PDF original de la plainte (document source)",
+            est_piece_jointe_originale=True
+        )
+        db.add(doc_record)
+        db.commit()
+        
+        logger.info(f"📎 Document attaché: {pdf_file.filename}")
+        
+        # Lancer l'analyse IA en arrière-plan (optionnel)
+        background_tasks.add_task(launch_background_analysis, new_plainte.id)
+        
+        # Réponse
+        return JSONResponse(
+            content={
+                "success": True,
+                "message": "Plainte créée avec succès",
+                "plainte": {
+                    "id": new_plainte.id,
+                    "numero_plainte": new_plainte.numero_plainte,
+                    "titre": new_plainte.titre,
+                    "description": new_plainte.description[:500] + "..." if len(new_plainte.description) > 500 else new_plainte.description,
+                    "statut": new_plainte.statut.value,
+                    "priorite": new_plainte.priorite.value,
+                    "service_id": new_plainte.service_id,
+                    "service_nom": service.nom,
+                    "date_creation": new_plainte.date_creation.isoformat()
+                },
+                "plaignant": {
+                    "nom": new_plainte.nom_plaignant,
+                    "prenom": new_plainte.prenom_plaignant,
+                    "email": new_plainte.email_plaignant,
+                    "telephone": new_plainte.telephone_plaignant
+                },
+                "document": {
+                    "nom_fichier": pdf_file.filename,
+                    "taille": len(content),
+                    "chemin_stockage": str(file_path)
+                },
+                "analyse_ia": {
+                    "statut": "en_cours",
+                    "message": "Analyse IA en cours en arrière-plan"
+                }
+            },
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                "Access-Control-Allow-Headers": "*"
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erreur création plainte depuis données validées: {e}")
+        import traceback
+        traceback.print_exc()
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
+
+
+@router.post("/depuis-pdf")
+async def create_complaint_from_pdf(
+    background_tasks: BackgroundTasks,
+    pdf_file: UploadFile = File(..., description="Fichier PDF de la plainte à analyser"),
+    service_id: Optional[int] = Form(None, description="ID du service (optionnel, sera détecté automatiquement)"),
+    # Données modifiées par l'utilisateur (prioritaires sur l'extraction IA)
+    titre: Optional[str] = Form(None, description="Titre de la plainte (modifié par l'utilisateur)"),
+    description: Optional[str] = Form(None, description="Description de la plainte (modifiée par l'utilisateur)"),
+    nom_plaignant: Optional[str] = Form(None, description="Nom du plaignant (modifié par l'utilisateur)"),
+    prenom_plaignant: Optional[str] = Form(None, description="Prénom du plaignant (modifié par l'utilisateur)"),
+    email_plaignant: Optional[str] = Form(None, description="Email du plaignant (modifié par l'utilisateur)"),
+    telephone_plaignant: Optional[str] = Form(None, description="Téléphone du plaignant (modifié par l'utilisateur)"),
+    db: Session = Depends(get_db)
+):
+    """
+    [DÉPRÉCIÉ - Utiliser /depuis-donnees-validees à la place]
+    Créer une nouvelle plainte à partir d'un PDF existant.
+    
+    Processus:
+    1. Upload et stockage du PDF original
+    2. Extraction du texte via PyPDF2
+    3. Analyse IA pour extraire les informations clés (Ollama/Mistral)
+    4. Création automatique de la plainte en BDD avec les données extraites
+    
+    Returns:
+        La plainte créée avec les données extraites et le statut de l'analyse
+    """
+    try:
+        logger.info(f"📄 Début de création de plainte depuis PDF: {pdf_file.filename}")
+        
+        # Vérification du type de fichier
+        if not pdf_file.filename.lower().endswith('.pdf'):
+            raise HTTPException(
+                status_code=400, 
+                detail="Seuls les fichiers PDF sont acceptés"
+            )
+        
+        # Vérification de la taille (max 10 MB)
+        content = await pdf_file.read()
+        if len(content) > 10 * 1024 * 1024:
+            raise HTTPException(
+                status_code=400, 
+                detail="Le fichier PDF ne doit pas dépasser 10 MB"
+            )
+        
+        # Génération du numéro de plainte
+        current_year = datetime.now().year
+        total_count = db.query(func.count(Plainte.id)).filter(
+            func.extract('year', Plainte.date_creation) == current_year
+        ).scalar() or 0
+        numero_plainte = f"PL_{current_year}_{str(total_count + 1).zfill(4)}"
+        
+        # Sauvegarde du PDF original
+        upload_dir = Path("data/documents/pdf_originaux")
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        
+        nom_stockage = f"{numero_plainte}_{pdf_file.filename}"
+        file_path = upload_dir / nom_stockage
+        
+        with open(file_path, "wb") as buffer:
+            buffer.write(content)
+        
+        logger.info(f"📁 PDF sauvegardé: {file_path} ({len(content)} octets)")
+        
+        # Extraction du texte du PDF
+        extracted_data = None
+        extracted_text = ""
+        
+        if PDF_EXTRACTION_AVAILABLE:
+            try:
+                # Utiliser le service de parsing de documents
+                document_parser = DocumentParserService()
+                extraction_result = document_parser.extract_text_from_document(str(file_path))
+                
+                if extraction_result["success"]:
+                    extracted_text = extraction_result["text"]
+                    logger.info(f"📝 Texte extrait: {len(extracted_text)} caractères")
+                    
+                    # Analyse IA pour extraire les données structurées
+                    try:
+                        llm_service = get_llm_service()
+                        analysis_service = ComplaintAnalysisService(llm_provider=llm_service)
+                        analysis_result = analysis_service.extract_complaint_data_from_pdf(extracted_text)
+                        
+                        if analysis_result.success:
+                            extracted_data = json.loads(analysis_result.content)
+                            logger.info(f"🤖 Données extraites par IA avec confiance: {analysis_result.confidence}")
+                    except Exception as ai_error:
+                        logger.warning(f"⚠️ Erreur analyse IA: {ai_error} - Utilisation extraction basique")
+                else:
+                    logger.warning(f"⚠️ Échec extraction texte: {extraction_result.get('error', 'Erreur inconnue')}")
+            except Exception as parse_error:
+                logger.error(f"❌ Erreur parsing PDF: {parse_error}")
+        else:
+            # Fallback: extraction basique avec PyPDF2
+            try:
+                import PyPDF2
+                await pdf_file.seek(0)  # Reset file position
+                with open(file_path, 'rb') as f:
+                    pdf_reader = PyPDF2.PdfReader(f)
+                    for page in pdf_reader.pages:
+                        page_text = page.extract_text()
+                        if page_text:
+                            extracted_text += page_text + "\n"
+                logger.info(f"📝 Texte extrait (fallback PyPDF2): {len(extracted_text)} caractères")
+            except Exception as pdf_error:
+                logger.error(f"❌ Erreur extraction PyPDF2: {pdf_error}")
+        
+        # Préparation des données pour la plainte
+        # Les données modifiées par l'utilisateur sont prioritaires sur l'extraction IA
+        plaignant_data = extracted_data.get("plaignant", {}) if extracted_data else {}
+        plainte_data = extracted_data.get("plainte", {}) if extracted_data else {}
+        analyse_data = extracted_data.get("analyse", {}) if extracted_data else {}
+        
+        # Utiliser les données utilisateur en priorité
+        final_titre = titre or plainte_data.get("titre") or "Plainte importée depuis PDF"
+        final_description = description or plainte_data.get("description") or (extracted_text[:2000] if extracted_text else "Contenu du PDF non extractible")
+        final_nom = nom_plaignant or plaignant_data.get("nom")
+        final_prenom = prenom_plaignant or plaignant_data.get("prenom")
+        final_email = email_plaignant or plaignant_data.get("email")
+        final_telephone = telephone_plaignant or plaignant_data.get("telephone")
+        
+        logger.info(f"📝 Données finales - Titre: {final_titre[:50]}..., Nom: {final_nom}, Prénom: {final_prenom}")
+        
+        # Détermination du service
+        if not service_id:
+            # Essayer de trouver le service par son nom
+            service_name = plainte_data.get("service_concerne")
+            if service_name:
+                service = db.query(Service).filter(
+                    Service.nom.ilike(f"%{service_name}%")
+                ).first()
+                if service:
+                    service_id = service.id
+            
+            # Fallback: prendre le premier service disponible
+            if not service_id:
+                default_service = db.query(Service).filter(Service.est_actif == True).first()
+                if default_service:
+                    service_id = default_service.id
+                else:
+                    raise HTTPException(status_code=400, detail="Aucun service disponible dans le système")
+        
+        # Vérifier que le service existe
+        service = db.query(Service).filter(Service.id == service_id).first()
+        if not service:
+            raise HTTPException(status_code=404, detail="Service non trouvé")
+        
+        # Détermination de la priorité
+        priorite_str = analyse_data.get("priorite_suggeree", "MOYEN")
+        try:
+            priorite = PrioritePlainte(priorite_str)
+        except ValueError:
+            priorite = PrioritePlainte.MOYEN
+        
+        # Conversion de la date d'incident
+        date_incident = None
+        date_incident_str = plainte_data.get("date_incident")
+        if date_incident_str:
+            try:
+                date_incident = datetime.strptime(date_incident_str, "%Y-%m-%d").date()
+            except ValueError:
+                pass
+        
+        # Création de la plainte avec les données finales (utilisateur ou IA)
+        new_plainte = Plainte(
+            numero_plainte=numero_plainte,
+            titre=final_titre[:500],  # Limiter la longueur du titre
+            description=final_description,
+            nom_plaignant=final_nom,
+            prenom_plaignant=final_prenom,
+            email_plaignant=final_email,
+            telephone_plaignant=final_telephone,
+            mode_reception=plainte_data.get("mode_reception", "pdf_import"),
+            service_id=service_id,
+            priorite=priorite,
+            statut=StatutPlainte.RECU,
+            date_incident=date_incident,
+            date_creation=datetime.now(),
+            date_modification=datetime.now()
+        )
+        
+        db.add(new_plainte)
+        db.commit()
+        db.refresh(new_plainte)
+        
+        logger.info(f"✅ Plainte créée depuis PDF: {new_plainte.numero_plainte} (ID: {new_plainte.id})")
+        
+        # Enregistrement du document PDF original
+        doc_record = DocumentPlainte(
+            plainte_id=new_plainte.id,
+            nom_fichier=pdf_file.filename,
+            nom_stockage=nom_stockage,
+            chemin_fichier=str(file_path),
+            type_fichier=TypeFichier.PDF,
+            taille_fichier=len(content),
+            mime_type="application/pdf",
+            description="PDF original de la plainte (document source)",
+            est_piece_jointe_originale=True
+        )
+        db.add(doc_record)
+        db.commit()
+        
+        # Création de l'enregistrement d'analyse IA avec les données extraites
+        analyse_ia = AnalyseIA(
+            plainte_id=new_plainte.id,
+            sentiment=analyse_data.get("gravite_estimee"),
+            priorite_ia=priorite_str,
+            resume_ia=analyse_data.get("resume_court"),
+            mots_cles_detectes=analyse_data.get("mots_cles") if isinstance(analyse_data.get("mots_cles"), list) else [],
+            statut_analyse="extraction_complete" if extracted_data else "en_attente",
+            confiance_sentiment=extracted_data.get("confiance_extraction", {}).get("score_global", 0.5) if extracted_data else 0.0,
+            date_analyse=datetime.now()
+        )
+        db.add(analyse_ia)
+        db.commit()
+        
+        # Lancer l'analyse complète en arrière-plan
+        background_tasks.add_task(launch_background_analysis, new_plainte.id)
+        
+        # Préparer la réponse
+        response_data = {
+            "success": True,
+            "message": "Plainte créée avec succès depuis le PDF",
+            "plainte": {
+                "id": new_plainte.id,
+                "numero_plainte": new_plainte.numero_plainte,
+                "titre": new_plainte.titre,
+                "description": new_plainte.description[:500] + "..." if len(new_plainte.description) > 500 else new_plainte.description,
+                "statut": new_plainte.statut.value,
+                "priorite": new_plainte.priorite.value,
+                "service_id": new_plainte.service_id,
+                "service_nom": service.nom,
+                "date_creation": new_plainte.date_creation.isoformat()
+            },
+            "plaignant": {
+                "nom": new_plainte.nom_plaignant,
+                "prenom": new_plainte.prenom_plaignant,
+                "email": new_plainte.email_plaignant,
+                "telephone": new_plainte.telephone_plaignant
+            },
+            "extraction": {
+                "texte_extrait_longueur": len(extracted_text),
+                "donnees_extraites": extracted_data is not None,
+                "confiance": extracted_data.get("confiance_extraction", {}).get("score_global") if extracted_data else None,
+                "champs_incertains": extracted_data.get("confiance_extraction", {}).get("champs_incertains") if extracted_data else []
+            },
+            "document": {
+                "nom_fichier": pdf_file.filename,
+                "taille": len(content),
+                "chemin_stockage": str(file_path)
+            },
+            "analyse_ia": {
+                "statut": "en_cours",
+                "message": "Analyse IA complète en cours en arrière-plan"
+            }
+        }
+        
+        return JSONResponse(
+            content=response_data,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                "Access-Control-Allow-Headers": "*"
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erreur création plainte depuis PDF: {e}")
+        import traceback
+        traceback.print_exc()
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la création de la plainte depuis le PDF: {str(e)}")
+
+
+# ==================== PRÉVISUALISATION PDF ASYNCHRONE ====================
+
+@router.post("/depuis-pdf/preview-async")
+async def preview_pdf_extraction_async(
+    pdf_file: UploadFile = File(..., description="Fichier PDF à analyser de manière asynchrone"),
+    db: Session = Depends(get_db)
+):
+    """
+    Lance l'extraction des données d'un PDF de manière ASYNCHRONE.
+    Retourne immédiatement un task_id. Le résultat sera envoyé via WebSocket.
+    
+    Workflow:
+    1. Upload du PDF et extraction du texte (rapide)
+    2. Retour immédiat avec task_id
+    3. Analyse IA en arrière-plan (Celery worker)
+    4. Notification WebSocket quand terminé (événement 'pdf_extraction_complete')
+    
+    Returns:
+        task_id pour suivre le traitement et recevoir les résultats via WebSocket
+    """
+    import uuid
+    
+    try:
+        logger.info(f"📄 [Async] Prévisualisation PDF: {pdf_file.filename}")
+        
+        # Vérification du type de fichier
+        if not pdf_file.filename.lower().endswith('.pdf'):
+            raise HTTPException(status_code=400, detail="Seuls les fichiers PDF sont acceptés")
+        
+        # Lecture du contenu
+        content = await pdf_file.read()
+        if len(content) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="Le fichier PDF ne doit pas dépasser 10 MB")
+        
+        # Générer un task_id unique
+        task_id = str(uuid.uuid4())
+        
+        # Sauvegarde temporaire pour extraction du texte
+        temp_dir = Path("data/temp")
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_path = temp_dir / f"async_{task_id}_{pdf_file.filename}"
+        
+        with open(temp_path, "wb") as buffer:
+            buffer.write(content)
+        
+        # Extraction rapide du texte (synchrone, car rapide)
+        extracted_text = ""
+        try:
+            if PDF_EXTRACTION_AVAILABLE:
+                document_parser = DocumentParserService()
+                extraction_result = document_parser.extract_text_from_document(str(temp_path))
+                if extraction_result["success"]:
+                    extracted_text = extraction_result["text"]
+            
+            if not extracted_text:
+                import PyPDF2
+                with open(temp_path, 'rb') as f:
+                    pdf_reader = PyPDF2.PdfReader(f)
+                    for page in pdf_reader.pages:
+                        page_text = page.extract_text()
+                        if page_text:
+                            extracted_text += page_text + "\n"
+        finally:
+            # Nettoyer le fichier temporaire
+            try:
+                os.remove(temp_path)
+            except:
+                pass
+        
+        if not extracted_text:
+            raise HTTPException(status_code=400, detail="Impossible d'extraire le texte du PDF")
+        
+        logger.info(f"📝 [Async] Texte extrait: {len(extracted_text)} caractères")
+        
+        # Lancer la tâche Celery pour l'analyse IA
+        try:
+            from healthcare_worker_server.app.tasks.celery_tasks import extract_pdf_data_async
+            celery_task = extract_pdf_data_async.delay(task_id, extracted_text, pdf_file.filename)
+            logger.info(f"🚀 [Async] Tâche Celery lancée: {celery_task.id}")
+        except Exception as celery_error:
+            logger.warning(f"⚠️ Celery non disponible: {celery_error}. Extraction synchrone de secours.")
+            # Fallback synchrone si Celery n'est pas disponible
+            try:
+                llm_service = get_llm_service()
+                analysis_service = ComplaintAnalysisService(llm_provider=llm_service)
+                analysis_result = analysis_service.extract_complaint_data_from_pdf(extracted_text)
+                
+                if analysis_result.success:
+                    extracted_data = json.loads(analysis_result.content)
+                else:
+                    extracted_data = _extract_basic_data_from_text(extracted_text)
+                
+                # Récupérer la liste des services disponibles
+                services = db.query(Service).filter(Service.est_actif == True).all()
+                services_list = [{"id": s.id, "nom": s.nom, "code": s.code_service} for s in services]
+                
+                return JSONResponse(content={
+                    "success": True,
+                    "async": False,  # Indique que c'est une réponse synchrone (fallback)
+                    "task_id": task_id,
+                    "filename": pdf_file.filename,
+                    "extraction": {
+                        "texte_brut": extracted_text[:3000],
+                        "texte_longueur": len(extracted_text),
+                        "donnees_structurees": extracted_data
+                    },
+                    "services_disponibles": services_list,
+                    "message": "Extraction terminée (mode synchrone)"
+                })
+            except Exception as sync_error:
+                logger.error(f"❌ Erreur extraction synchrone: {sync_error}")
+                raise HTTPException(status_code=500, detail=str(sync_error))
+        
+        # Récupérer la liste des services disponibles
+        services = db.query(Service).filter(Service.est_actif == True).all()
+        services_list = [{"id": s.id, "nom": s.nom, "code": s.code_service} for s in services]
+        
+        # Retourner immédiatement avec le task_id
+        return JSONResponse(content={
+            "success": True,
+            "async": True,
+            "task_id": task_id,
+            "celery_task_id": celery_task.id,
+            "filename": pdf_file.filename,
+            "file_size": len(content),
+            "text_length": len(extracted_text),
+            "services_disponibles": services_list,
+            "message": "Analyse IA en cours. Vous serez notifié via WebSocket quand elle sera terminée.",
+            "websocket_events": {
+                "started": "pdf_extraction_started",
+                "complete": "pdf_extraction_complete", 
+                "failed": "pdf_extraction_failed"
+            }
+        })
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erreur prévisualisation async PDF: {e}")
+        raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
+
+
+@router.post("/depuis-pdf/preview")
+async def preview_pdf_extraction(
+    pdf_file: UploadFile = File(..., description="Fichier PDF à analyser pour prévisualisation"),
+    db: Session = Depends(get_db)
+):
+    """
+    Prévisualise l'extraction des données d'un PDF sans créer de plainte.
+    Permet à l'utilisateur de vérifier et corriger les données avant la création.
+    
+    Returns:
+        Les données extraites du PDF pour validation par l'utilisateur
+    """
+    try:
+        logger.info(f"👁️ Prévisualisation de l'extraction PDF: {pdf_file.filename}")
+        
+        # Vérification du type de fichier
+        if not pdf_file.filename.lower().endswith('.pdf'):
+            raise HTTPException(
+                status_code=400, 
+                detail="Seuls les fichiers PDF sont acceptés"
+            )
+        
+        # Lecture du contenu
+        content = await pdf_file.read()
+        if len(content) > 10 * 1024 * 1024:
+            raise HTTPException(
+                status_code=400, 
+                detail="Le fichier PDF ne doit pas dépasser 10 MB"
+            )
+        
+        # Sauvegarde temporaire pour analyse
+        temp_dir = Path("data/temp")
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_path = temp_dir / f"preview_{datetime.now().strftime('%Y%m%d%H%M%S')}_{pdf_file.filename}"
+        
+        with open(temp_path, "wb") as buffer:
+            buffer.write(content)
+        
+        extracted_text = ""
+        extracted_data = None
+        
+        try:
+            # Étape 1: Extraction du texte
+            if PDF_EXTRACTION_AVAILABLE:
+                document_parser = DocumentParserService()
+                extraction_result = document_parser.extract_text_from_document(str(temp_path))
+                
+                if extraction_result["success"]:
+                    extracted_text = extraction_result["text"]
+                    logger.info(f"✅ Texte extrait via DocumentParserService: {len(extracted_text)} caractères")
+                else:
+                    logger.warning(f"⚠️ Échec DocumentParserService, fallback PyPDF2")
+                    # Fallback PyPDF2
+                    import PyPDF2
+                    with open(temp_path, 'rb') as f:
+                        pdf_reader = PyPDF2.PdfReader(f)
+                        for page in pdf_reader.pages:
+                            page_text = page.extract_text()
+                            if page_text:
+                                extracted_text += page_text + "\n"
+            else:
+                # Fallback PyPDF2
+                logger.info("📄 Extraction du texte via PyPDF2 (fallback)")
+                import PyPDF2
+                with open(temp_path, 'rb') as f:
+                    pdf_reader = PyPDF2.PdfReader(f)
+                    for page in pdf_reader.pages:
+                        page_text = page.extract_text()
+                        if page_text:
+                            extracted_text += page_text + "\n"
+                logger.info(f"✅ Texte extrait via PyPDF2: {len(extracted_text)} caractères")
+            
+            # Étape 2: Analyse IA (toujours essayer si on a du texte)
+            if extracted_text:
+                try:
+                    logger.info("🤖 Démarrage de l'analyse IA...")
+                    llm_service = get_llm_service()
+                    logger.info(f"📡 Service LLM utilisé: {type(llm_service).__name__}")
+                    analysis_service = ComplaintAnalysisService(llm_provider=llm_service)
+                    analysis_result = analysis_service.extract_complaint_data_from_pdf(extracted_text)
+                    
+                    if analysis_result.success:
+                        extracted_data = json.loads(analysis_result.content)
+                        logger.info(f"✅ Données extraites par IA: {list(extracted_data.keys()) if extracted_data else 'None'}")
+                    else:
+                        logger.warning(f"⚠️ Analyse IA non réussie, utilisation du fallback regex")
+                except Exception as ai_error:
+                    logger.warning(f"⚠️ Erreur analyse IA preview: {ai_error}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Étape 3: Fallback extraction basique si pas de données IA
+            if extracted_data is None and extracted_text:
+                logger.info("🔄 Utilisation de l'extraction basique (regex) comme fallback")
+                extracted_data = _extract_basic_data_from_text(extracted_text)
+                
+        finally:
+            # Nettoyer le fichier temporaire
+            try:
+                os.remove(temp_path)
+            except:
+                pass
+        
+        # Récupérer la liste des services disponibles
+        services = db.query(Service).filter(Service.est_actif == True).all()
+        services_list = [{"id": s.id, "nom": s.nom, "code": s.code_service} for s in services]
+        
+        response_data = {
+            "success": True,
+            "filename": pdf_file.filename,
+            "file_size": len(content),
+            "extraction": {
+                "texte_brut": extracted_text[:3000] if len(extracted_text) > 3000 else extracted_text,
+                "texte_longueur": len(extracted_text),
+                "donnees_structurees": extracted_data
+            },
+            "services_disponibles": services_list,
+            "message": "Prévisualisation réussie. Vérifiez les données avant de créer la plainte."
+        }
+        
+        return JSONResponse(content=response_data)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erreur prévisualisation PDF: {e}")
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la prévisualisation: {str(e)}")
+
+
+# ==================== CRÉATION DEPUIS IMAGE (PHOTO) ====================
+
+@router.post("/depuis-image/preview")
+async def preview_image_extraction(
+    image_file: UploadFile = File(..., description="Image à analyser pour prévisualisation (jpg, png, webp)"),
+    db: Session = Depends(get_db)
+):
+    """
+    Prévisualise l'extraction des données d'une image via OCR sans créer de plainte.
+    Permet à l'utilisateur de vérifier et corriger les données avant la création.
+    
+    Formats supportés: JPG, PNG, WEBP, TIFF, BMP, GIF
+    
+    Returns:
+        Les données extraites de l'image pour validation par l'utilisateur
+    """
+    try:
+        logger.info(f"👁️ Prévisualisation de l'extraction image: {image_file.filename}")
+        
+        # Vérification du type de fichier
+        allowed_extensions = ['.jpg', '.jpeg', '.png', '.webp', '.tiff', '.bmp', '.gif']
+        file_ext = Path(image_file.filename).suffix.lower()
+        
+        if file_ext not in allowed_extensions:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Format d'image non supporté. Formats acceptés: {', '.join(allowed_extensions)}"
+            )
+        
+        # Lecture du contenu
+        content = await image_file.read()
+        if len(content) > 15 * 1024 * 1024:  # 15 MB pour les images
+            raise HTTPException(
+                status_code=400, 
+                detail="L'image ne doit pas dépasser 15 MB"
+            )
+        
+        extracted_text = ""
+        extracted_data = None
+        ocr_confidence = 0.0
+        ocr_metadata = {}
+        
+        # Étape 1: Extraction du texte via OCR
+        if IMAGE_OCR_AVAILABLE:
+            try:
+                ocr_service = get_ocr_service()
+                ocr_result = ocr_service.extract_text_from_image(content, image_file.filename)
+                
+                if ocr_result["success"]:
+                    extracted_text = ocr_result["text"]
+                    ocr_confidence = ocr_result.get("confidence", 0.5)
+                    ocr_metadata = ocr_result.get("metadata", {})
+                    logger.info(f"✅ Texte extrait via OCR: {len(extracted_text)} caractères, confiance: {ocr_confidence:.2f}")
+                else:
+                    logger.warning(f"⚠️ OCR échoué: {ocr_result.get('error', 'Erreur inconnue')}")
+            except Exception as ocr_error:
+                logger.error(f"❌ Erreur OCR: {ocr_error}")
+        else:
+            # Fallback: utiliser pytesseract directement
+            logger.info("📄 Extraction du texte via pytesseract (fallback)")
+            try:
+                from PIL import Image
+                import pytesseract
+                import io
+                
+                image = Image.open(io.BytesIO(content))
+                extracted_text = pytesseract.image_to_string(image, config=r'--oem 3 --psm 6 -l fra+eng')
+                ocr_confidence = 0.5  # Confiance par défaut sans métadonnées
+                logger.info(f"✅ Texte extrait via pytesseract fallback: {len(extracted_text)} caractères")
+            except Exception as fallback_error:
+                logger.error(f"❌ Erreur pytesseract fallback: {fallback_error}")
+        
+        # Étape 2: Analyse IA (si on a du texte)
+        if extracted_text and PDF_EXTRACTION_AVAILABLE:
+            try:
+                logger.info("🤖 Démarrage de l'analyse IA...")
+                llm_service = get_llm_service()
+                logger.info(f"📡 Service LLM utilisé: {type(llm_service).__name__}")
+                analysis_service = ComplaintAnalysisService(llm_provider=llm_service)
+                analysis_result = analysis_service.extract_complaint_data_from_pdf(extracted_text)
+                
+                if analysis_result.success:
+                    extracted_data = json.loads(analysis_result.content)
+                    logger.info(f"✅ Données extraites par IA: {list(extracted_data.keys()) if extracted_data else 'None'}")
+                else:
+                    logger.warning(f"⚠️ Analyse IA non réussie, utilisation du fallback regex")
+            except Exception as ai_error:
+                logger.warning(f"⚠️ Erreur analyse IA preview: {ai_error}")
+                import traceback
+                traceback.print_exc()
+        
+        # Étape 3: Fallback extraction basique si pas de données IA
+        if extracted_data is None and extracted_text:
+            logger.info("🔄 Utilisation de l'extraction basique (regex) comme fallback")
+            extracted_data = _extract_basic_data_from_text(extracted_text)
+            # Ajuster le mode de réception pour les images
+            if extracted_data and extracted_data.get("plainte"):
+                extracted_data["plainte"]["mode_reception"] = "photo_import"
+        
+        # Ajouter les informations OCR à la confiance d'extraction
+        if extracted_data:
+            if "confiance_extraction" not in extracted_data:
+                extracted_data["confiance_extraction"] = {}
+            extracted_data["confiance_extraction"]["score_ocr"] = ocr_confidence
+            extracted_data["confiance_extraction"]["qualite_ocr"] = (
+                "excellent" if ocr_confidence >= 0.8 else
+                "bon" if ocr_confidence >= 0.6 else
+                "moyen" if ocr_confidence >= 0.4 else
+                "faible"
+            )
+        
+        # Récupérer la liste des services disponibles
+        services = db.query(Service).filter(Service.est_actif == True).all()
+        services_list = [{"id": s.id, "nom": s.nom, "code": s.code_service} for s in services]
+        
+        response_data = {
+            "success": True,
+            "filename": image_file.filename,
+            "file_size": len(content),
+            "extraction": {
+                "texte_brut": extracted_text[:3000] if len(extracted_text) > 3000 else extracted_text,
+                "texte_longueur": len(extracted_text),
+                "donnees_structurees": extracted_data
+            },
+            "ocr_info": {
+                "confiance": ocr_confidence,
+                "qualite": (
+                    "excellent" if ocr_confidence >= 0.8 else
+                    "bon" if ocr_confidence >= 0.6 else
+                    "moyen" if ocr_confidence >= 0.4 else
+                    "faible"
+                ),
+                "metadata": ocr_metadata
+            },
+            "services_disponibles": services_list,
+            "message": "Prévisualisation réussie. Vérifiez les données extraites par OCR avant de créer la plainte."
+        }
+        
+        return JSONResponse(content=response_data)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erreur prévisualisation image: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la prévisualisation: {str(e)}")
+
+
+@router.post("/depuis-image")
+async def create_complaint_from_image(
+    background_tasks: BackgroundTasks,
+    image_file: UploadFile = File(..., description="Image de la plainte à analyser (jpg, png, webp)"),
+    service_id: Optional[int] = Form(None, description="ID du service (optionnel, sera détecté automatiquement)"),
+    # Données modifiées par l'utilisateur (prioritaires sur l'extraction OCR)
+    titre: Optional[str] = Form(None, description="Titre de la plainte (modifié par l'utilisateur)"),
+    description: Optional[str] = Form(None, description="Description de la plainte (modifiée par l'utilisateur)"),
+    nom_plaignant: Optional[str] = Form(None, description="Nom du plaignant (modifié par l'utilisateur)"),
+    prenom_plaignant: Optional[str] = Form(None, description="Prénom du plaignant (modifié par l'utilisateur)"),
+    email_plaignant: Optional[str] = Form(None, description="Email du plaignant (modifié par l'utilisateur)"),
+    telephone_plaignant: Optional[str] = Form(None, description="Téléphone du plaignant (modifié par l'utilisateur)"),
+    mode_reception: Optional[str] = Form("photo_import", description="Mode de réception"),
+    date_incident: Optional[str] = Form(None, description="Date de l'incident"),
+    priorite: Optional[str] = Form("MOYEN", description="Priorité de la plainte"),
+    assigned_user_id: Optional[int] = Form(None, description="ID de l'utilisateur assigné"),
+    db: Session = Depends(get_db)
+):
+    """
+    Créer une nouvelle plainte à partir d'une image (photo de document).
+    
+    Processus:
+    1. Upload et stockage de l'image originale
+    2. Extraction du texte via OCR (Tesseract)
+    3. Analyse IA pour extraire les informations clés (Ollama/Mistral)
+    4. Création automatique de la plainte en BDD avec les données extraites
+    
+    Formats supportés: JPG, PNG, WEBP, TIFF, BMP, GIF
+    
+    Returns:
+        La plainte créée avec les données extraites et le statut de l'analyse
+    """
+    try:
+        logger.info(f"📷 Début de création de plainte depuis image: {image_file.filename}")
+        
+        # Vérification du type de fichier
+        allowed_extensions = ['.jpg', '.jpeg', '.png', '.webp', '.tiff', '.bmp', '.gif']
+        file_ext = Path(image_file.filename).suffix.lower()
+        
+        if file_ext not in allowed_extensions:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Format d'image non supporté. Formats acceptés: {', '.join(allowed_extensions)}"
+            )
+        
+        # Vérification de la taille (max 15 MB)
+        content = await image_file.read()
+        if len(content) > 15 * 1024 * 1024:
+            raise HTTPException(
+                status_code=400, 
+                detail="L'image ne doit pas dépasser 15 MB"
+            )
+        
+        # Génération du numéro de plainte
+        current_year = datetime.now().year
+        total_count = db.query(func.count(Plainte.id)).filter(
+            func.extract('year', Plainte.date_creation) == current_year
+        ).scalar() or 0
+        numero_plainte = f"PL_{current_year}_{str(total_count + 1).zfill(4)}"
+        
+        # Sauvegarde de l'image originale
+        upload_dir = Path("data/documents/images_originales")
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        
+        nom_stockage = f"{numero_plainte}_{image_file.filename}"
+        file_path = upload_dir / nom_stockage
+        
+        with open(file_path, "wb") as buffer:
+            buffer.write(content)
+        
+        logger.info(f"📁 Image sauvegardée: {file_path} ({len(content)} octets)")
+        
+        # Extraction du texte via OCR
+        extracted_data = None
+        extracted_text = ""
+        ocr_confidence = 0.0
+        
+        if IMAGE_OCR_AVAILABLE:
+            try:
+                ocr_service = get_ocr_service()
+                ocr_result = ocr_service.extract_text_from_image(content, image_file.filename)
+                
+                if ocr_result["success"]:
+                    extracted_text = ocr_result["text"]
+                    ocr_confidence = ocr_result.get("confidence", 0.5)
+                    logger.info(f"📝 Texte extrait par OCR: {len(extracted_text)} caractères, confiance: {ocr_confidence:.2f}")
+                    
+                    # Analyse IA pour extraire les données structurées
+                    if PDF_EXTRACTION_AVAILABLE:
+                        try:
+                            llm_service = get_llm_service()
+                            analysis_service = ComplaintAnalysisService(llm_provider=llm_service)
+                            analysis_result = analysis_service.extract_complaint_data_from_pdf(extracted_text)
+                            
+                            if analysis_result.success:
+                                extracted_data = json.loads(analysis_result.content)
+                                logger.info(f"🤖 Données extraites par IA avec confiance: {analysis_result.confidence}")
+                        except Exception as ai_error:
+                            logger.warning(f"⚠️ Erreur analyse IA: {ai_error} - Utilisation extraction basique")
+                else:
+                    logger.warning(f"⚠️ Échec OCR: {ocr_result.get('error', 'Erreur inconnue')}")
+            except Exception as ocr_error:
+                logger.error(f"❌ Erreur OCR: {ocr_error}")
+        else:
+            # Fallback: extraction basique avec pytesseract
+            try:
+                from PIL import Image
+                import pytesseract
+                import io
+                
+                image = Image.open(io.BytesIO(content))
+                extracted_text = pytesseract.image_to_string(image, config=r'--oem 3 --psm 6 -l fra+eng')
+                ocr_confidence = 0.5
+                logger.info(f"📝 Texte extrait (fallback pytesseract): {len(extracted_text)} caractères")
+            except Exception as ocr_error:
+                logger.error(f"❌ Erreur extraction pytesseract: {ocr_error}")
+        
+        # Préparation des données pour la plainte
+        # Les données modifiées par l'utilisateur sont prioritaires sur l'extraction OCR
+        plaignant_data = extracted_data.get("plaignant", {}) if extracted_data else {}
+        plainte_data = extracted_data.get("plainte", {}) if extracted_data else {}
+        analyse_data = extracted_data.get("analyse", {}) if extracted_data else {}
+        
+        # Utiliser les données utilisateur en priorité
+        final_titre = titre or plainte_data.get("titre") or "Plainte importée depuis image"
+        final_description = description or plainte_data.get("description") or (extracted_text[:2000] if extracted_text else "Contenu de l'image non extractible")
+        final_nom = nom_plaignant or plaignant_data.get("nom")
+        final_prenom = prenom_plaignant or plaignant_data.get("prenom")
+        final_email = email_plaignant or plaignant_data.get("email")
+        final_telephone = telephone_plaignant or plaignant_data.get("telephone")
+        
+        # Priorité: utilisateur > IA > défaut
+        final_priorite = priorite or analyse_data.get("priorite_suggeree", "MOYEN")
+        
+        # Mode de réception par défaut pour les images
+        final_mode_reception = mode_reception or plainte_data.get("mode_reception") or "photo_import"
+        
+        # Date incident
+        final_date_incident = None
+        if date_incident:
+            try:
+                final_date_incident = datetime.strptime(date_incident, "%Y-%m-%d")
+            except:
+                pass
+        elif plainte_data.get("date_incident"):
+            try:
+                final_date_incident = datetime.strptime(plainte_data["date_incident"], "%Y-%m-%d")
+            except:
+                pass
+        
+        # Sélection du service
+        if service_id:
+            service = db.query(Service).filter(Service.id == service_id).first()
+        else:
+            # Essayer de trouver via l'extraction
+            service_nom = plainte_data.get("service_concerne")
+            if service_nom:
+                service = db.query(Service).filter(
+                    Service.nom.ilike(f"%{service_nom}%")
+                ).first()
+            else:
+                service = None
+        
+        # Service par défaut si non trouvé
+        if not service:
+            service = db.query(Service).filter(Service.est_actif == True).first()
+            if not service:
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Aucun service disponible dans le système"
+                )
+        
+        # Créer la plainte en base
+        new_plainte = Plainte(
+            numero_plainte=numero_plainte,
+            titre=final_titre[:200],  # Limiter la longueur
+            description=final_description,
+            statut=StatutPlainte.NOUVELLE,
+            priorite=PrioritePlainte(final_priorite) if final_priorite in [p.value for p in PrioritePlainte] else PrioritePlainte.MOYEN,
+            service_id=service.id,
+            mode_reception=final_mode_reception,
+            date_incident=final_date_incident,
+            # Informations du plaignant
+            nom_plaignant=final_nom,
+            prenom_plaignant=final_prenom,
+            email_plaignant=final_email,
+            telephone_plaignant=final_telephone,
+            # Métadonnées
+            source_document=str(file_path),
+            texte_original=extracted_text[:10000] if extracted_text else None,  # Limiter la taille
+            assignee_a_id=assigned_user_id
+        )
+        
+        db.add(new_plainte)
+        db.commit()
+        db.refresh(new_plainte)
+        
+        logger.info(f"✅ Plainte créée: {numero_plainte} (ID: {new_plainte.id})")
+        
+        # Créer l'entrée DocumentPlainte pour l'image
+        try:
+            document = DocumentPlainte(
+                plainte_id=new_plainte.id,
+                nom_fichier=image_file.filename,
+                nom_fichier_stockage=nom_stockage,
+                chemin_stockage=str(file_path),
+                type_fichier=TypeFichier.IMAGE,
+                taille_fichier=len(content),
+                mime_type=f"image/{file_ext.replace('.', '')}",
+                description="Image originale de la plainte (import OCR)"
+            )
+            db.add(document)
+            db.commit()
+            logger.info(f"📄 Document image enregistré en BDD")
+        except Exception as doc_error:
+            logger.warning(f"⚠️ Erreur enregistrement document: {doc_error}")
+        
+        # Lancer l'analyse complète en arrière-plan
+        background_tasks.add_task(launch_background_analysis, new_plainte.id)
+        
+        # Préparer la réponse
+        response_data = {
+            "success": True,
+            "message": "Plainte créée avec succès depuis l'image",
+            "plainte": {
+                "id": new_plainte.id,
+                "numero_plainte": new_plainte.numero_plainte,
+                "titre": new_plainte.titre,
+                "description": new_plainte.description[:500] + "..." if len(new_plainte.description) > 500 else new_plainte.description,
+                "statut": new_plainte.statut.value,
+                "priorite": new_plainte.priorite.value,
+                "service_id": new_plainte.service_id,
+                "service_nom": service.nom,
+                "date_creation": new_plainte.date_creation.isoformat()
+            },
+            "plaignant": {
+                "nom": new_plainte.nom_plaignant,
+                "prenom": new_plainte.prenom_plaignant,
+                "email": new_plainte.email_plaignant,
+                "telephone": new_plainte.telephone_plaignant
+            },
+            "extraction": {
+                "texte_extrait_longueur": len(extracted_text),
+                "donnees_extraites": extracted_data is not None,
+                "confiance_ocr": ocr_confidence,
+                "confiance": extracted_data.get("confiance_extraction", {}).get("score_global") if extracted_data else None,
+                "champs_incertains": extracted_data.get("confiance_extraction", {}).get("champs_incertains") if extracted_data else []
+            },
+            "document": {
+                "nom_fichier": image_file.filename,
+                "taille": len(content),
+                "chemin_stockage": str(file_path)
+            },
+            "analyse_ia": {
+                "statut": "en_cours",
+                "message": "Analyse IA complète en cours en arrière-plan"
+            }
+        }
+        
+        return JSONResponse(
+            content=response_data,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                "Access-Control-Allow-Headers": "*"
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erreur création plainte depuis image: {e}")
+        import traceback
+        traceback.print_exc()
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la création de la plainte depuis l'image: {str(e)}")

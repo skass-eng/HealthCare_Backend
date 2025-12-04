@@ -428,3 +428,160 @@ async def websocket_test(websocket: WebSocket):
             await websocket.close(code=4000, reason="Erreur serveur")
         except:
             pass
+
+
+# ==================== WEBSOCKET POUR LES EXTRACTIONS ====================
+
+# Gestionnaire de connexions pour les extractions
+class ExtractionConnectionManager:
+    """
+    Gestionnaire de connexions WebSocket pour les extractions PDF/Image
+    """
+    
+    def __init__(self):
+        # Connexions par task_id
+        self.task_connections: Dict[str, List[WebSocket]] = {}
+        # Toutes les connexions actives pour broadcast
+        self.all_connections: List[WebSocket] = []
+    
+    async def connect(self, websocket: WebSocket, task_id: Optional[str] = None):
+        """Accepter une connexion pour suivre une extraction"""
+        if task_id:
+            if task_id not in self.task_connections:
+                self.task_connections[task_id] = []
+            self.task_connections[task_id].append(websocket)
+        
+        self.all_connections.append(websocket)
+        logger.info(f"✅ Connexion extraction WebSocket - Task: {task_id}")
+    
+    def disconnect(self, websocket: WebSocket, task_id: Optional[str] = None):
+        """Déconnecter un WebSocket"""
+        try:
+            if task_id and task_id in self.task_connections:
+                if websocket in self.task_connections[task_id]:
+                    self.task_connections[task_id].remove(websocket)
+                if not self.task_connections[task_id]:
+                    del self.task_connections[task_id]
+            
+            if websocket in self.all_connections:
+                self.all_connections.remove(websocket)
+                
+            logger.info(f"📡 Déconnexion extraction WebSocket - Task: {task_id}")
+        except Exception as e:
+            logger.error(f"❌ Erreur déconnexion: {e}")
+    
+    async def send_to_task(self, task_id: str, message: dict):
+        """Envoyer un message à tous les clients suivant une tâche"""
+        if task_id in self.task_connections:
+            disconnected = []
+            for ws in self.task_connections[task_id]:
+                try:
+                    await ws.send_text(json.dumps(message, default=str))
+                except Exception as e:
+                    logger.error(f"❌ Erreur envoi: {e}")
+                    disconnected.append(ws)
+            
+            for ws in disconnected:
+                self.disconnect(ws, task_id)
+    
+    async def broadcast(self, message: dict):
+        """Broadcast à toutes les connexions"""
+        disconnected = []
+        for ws in self.all_connections:
+            try:
+                await ws.send_text(json.dumps(message, default=str))
+            except Exception as e:
+                disconnected.append(ws)
+        
+        for ws in disconnected:
+            self.all_connections.remove(ws)
+
+
+# Instance globale
+extraction_manager = ExtractionConnectionManager()
+
+
+@router.websocket("/extraction")
+async def websocket_extraction(websocket: WebSocket):
+    """
+    WebSocket pour suivre les extractions PDF/Image en temps réel.
+    
+    Le client peut envoyer:
+    - {"type": "subscribe", "task_id": "xxx"} pour suivre une tâche spécifique
+    - {"type": "heartbeat"} pour garder la connexion active
+    
+    Le serveur envoie:
+    - {"event": "pdf_extraction_started", "data": {...}}
+    - {"event": "pdf_extraction_complete", "data": {...}}
+    - {"event": "pdf_extraction_failed", "data": {...}}
+    - {"event": "image_extraction_started", "data": {...}}
+    - {"event": "image_extraction_complete", "data": {...}}
+    - {"event": "image_extraction_failed", "data": {...}}
+    """
+    try:
+        await websocket.accept()
+        await extraction_manager.connect(websocket)
+        
+        # Envoyer confirmation de connexion
+        await websocket.send_text(json.dumps({
+            "event": "connected",
+            "message": "Connexion WebSocket extraction établie",
+            "timestamp": datetime.now().isoformat()
+        }))
+        
+        subscribed_task_id = None
+        
+        try:
+            while True:
+                data = await websocket.receive_text()
+                message = json.loads(data)
+                
+                if message.get("type") == "subscribe" and message.get("task_id"):
+                    subscribed_task_id = message["task_id"]
+                    await extraction_manager.connect(websocket, subscribed_task_id)
+                    await websocket.send_text(json.dumps({
+                        "event": "subscribed",
+                        "task_id": subscribed_task_id,
+                        "message": f"Abonné aux notifications de la tâche {subscribed_task_id}"
+                    }))
+                
+                elif message.get("type") == "heartbeat":
+                    await websocket.send_text(json.dumps({
+                        "event": "heartbeat_ack",
+                        "timestamp": datetime.now().isoformat()
+                    }))
+                    
+        except WebSocketDisconnect:
+            pass
+        finally:
+            extraction_manager.disconnect(websocket, subscribed_task_id)
+            
+    except Exception as e:
+        logger.error(f"❌ Erreur WebSocket extraction: {e}")
+        try:
+            await websocket.close(code=4000, reason="Erreur serveur")
+        except:
+            pass
+
+
+# ==================== FONCTION POUR ENVOYER DES NOTIFICATIONS ====================
+
+async def notify_extraction_event(event: str, data: dict):
+    """
+    Fonction utilitaire pour envoyer une notification d'extraction.
+    Peut être appelée depuis les endpoints API.
+    """
+    message = {
+        "event": event,
+        "data": data,
+        "timestamp": datetime.now().isoformat()
+    }
+    
+    task_id = data.get("task_id")
+    
+    if task_id:
+        # Envoyer aux abonnés de cette tâche spécifique
+        await extraction_manager.send_to_task(task_id, message)
+    
+    # Broadcast à tous (pour ceux qui écoutent tout)
+    await extraction_manager.broadcast(message)

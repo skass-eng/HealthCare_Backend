@@ -68,7 +68,7 @@ def start_api_server():
         'API_PORT': str(API_PORT),
         'SECRET_KEY': 'your-secret-key-change-this-in-production',
         'LLM_PROVIDER': 'ollama',
-        'LLM_MODEL': 'mistral:instruct',
+        'LLM_MODEL': 'qwen2.5:7b',
         'LLM_BASE_URL': 'http://localhost:11434',
         'PYTHONPATH': str(backend_dir)
     })
