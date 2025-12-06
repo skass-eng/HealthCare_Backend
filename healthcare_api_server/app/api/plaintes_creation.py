@@ -990,7 +990,7 @@ async def create_complaint_from_validated_data(
             date_incident=date_incident_parsed,
             date_creation=datetime.now(),
             date_modification=datetime.now(),
-            assigned_user_id=assigned_user_id
+            assignee_a_id=assigned_user_id
         )
         
         db.add(new_plainte)
@@ -1062,6 +1062,205 @@ async def create_complaint_from_validated_data(
         raise
     except Exception as e:
         logger.error(f"❌ Erreur création plainte depuis données validées: {e}")
+        import traceback
+        traceback.print_exc()
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
+
+
+# ==================== CRÉATION DEPUIS IMAGE AVEC DONNÉES VALIDÉES ====================
+
+@router.post("/depuis-image/donnees-validees")
+async def create_complaint_from_image_validated_data(
+    background_tasks: BackgroundTasks,
+    image_file: UploadFile = File(..., description="Image à rattacher à la plainte (jpg, png, webp)"),
+    service_id: int = Form(..., description="ID du service"),
+    # Données validées par l'utilisateur (obligatoires)
+    titre: str = Form(..., description="Titre de la plainte (validé par l'utilisateur)"),
+    description: str = Form(..., description="Description de la plainte (validée par l'utilisateur)"),
+    nom_plaignant: str = Form(..., description="Nom du plaignant (validé par l'utilisateur)"),
+    prenom_plaignant: str = Form(..., description="Prénom du plaignant (validé par l'utilisateur)"),
+    # Données optionnelles
+    email_plaignant: Optional[str] = Form(None, description="Email du plaignant"),
+    telephone_plaignant: Optional[str] = Form(None, description="Téléphone du plaignant"),
+    mode_reception: Optional[str] = Form("photo_import", description="Mode de réception"),
+    date_incident: Optional[str] = Form(None, description="Date de l'incident (YYYY-MM-DD)"),
+    priorite: Optional[str] = Form("MOYEN", description="Priorité de la plainte"),
+    assigned_user_id: Optional[int] = Form(None, description="ID de l'utilisateur assigné"),
+    db: Session = Depends(get_db)
+):
+    """
+    Créer une nouvelle plainte avec les données VALIDÉES par l'utilisateur à partir d'une image.
+    
+    Cette route est optimisée pour être utilisée APRÈS la prévisualisation OCR.
+    Elle ne refait PAS l'OCR/analyse IA - elle utilise directement les données validées.
+    
+    Processus:
+    1. Validation des données obligatoires
+    2. Upload et stockage de l'image originale
+    3. Création directe de la plainte en BDD
+    4. Rattachement de l'image à la plainte
+    5. Lancement de l'analyse IA en arrière-plan (optionnel)
+    
+    Formats supportés: JPG, PNG, WEBP, TIFF, BMP, GIF
+    
+    Returns:
+        La plainte créée avec le document attaché
+    """
+    try:
+        logger.info(f"📷 Création plainte depuis données validées - Image: {image_file.filename}")
+        logger.info(f"📝 Données: titre={titre[:50]}..., nom={nom_plaignant}, prenom={prenom_plaignant}, service={service_id}")
+        
+        # Vérification du type de fichier
+        allowed_extensions = ['.jpg', '.jpeg', '.png', '.webp', '.tiff', '.bmp', '.gif']
+        file_ext = Path(image_file.filename).suffix.lower()
+        
+        if file_ext not in allowed_extensions:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Format d'image non supporté. Formats acceptés: {', '.join(allowed_extensions)}"
+            )
+        
+        # Lecture et vérification de la taille
+        content = await image_file.read()
+        if len(content) > 15 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="L'image ne doit pas dépasser 15 MB")
+        
+        # Vérifier que le service existe
+        service = db.query(Service).filter(Service.id == service_id).first()
+        if not service:
+            raise HTTPException(status_code=404, detail=f"Service ID {service_id} non trouvé")
+        
+        # Génération du numéro de plainte
+        current_year = datetime.now().year
+        total_count = db.query(func.count(Plainte.id)).filter(
+            func.extract('year', Plainte.date_creation) == current_year
+        ).scalar() or 0
+        numero_plainte = f"PL_{current_year}_{str(total_count + 1).zfill(4)}"
+        
+        # Sauvegarde de l'image originale
+        upload_dir = Path("data/documents/images_originales")
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        
+        nom_stockage = f"{numero_plainte}_{image_file.filename}"
+        file_path = upload_dir / nom_stockage
+        
+        with open(file_path, "wb") as buffer:
+            buffer.write(content)
+        
+        logger.info(f"📁 Image sauvegardée: {file_path} ({len(content)} octets)")
+        
+        # Conversion de la priorité
+        try:
+            priorite_enum = PrioritePlainte(priorite) if priorite else PrioritePlainte.MOYEN
+        except ValueError:
+            priorite_enum = PrioritePlainte.MOYEN
+        
+        # Conversion de la date d'incident
+        date_incident_parsed = None
+        if date_incident:
+            try:
+                date_incident_parsed = datetime.strptime(date_incident, "%Y-%m-%d").date()
+            except ValueError:
+                pass
+        
+        # Création de la plainte avec les données validées
+        new_plainte = Plainte(
+            numero_plainte=numero_plainte,
+            titre=titre[:500],
+            description=description,
+            nom_plaignant=nom_plaignant,
+            prenom_plaignant=prenom_plaignant,
+            email_plaignant=email_plaignant,
+            telephone_plaignant=telephone_plaignant,
+            mode_reception=mode_reception or "photo_import",
+            service_id=service_id,
+            priorite=priorite_enum,
+            statut=StatutPlainte.RECU,
+            date_incident=date_incident_parsed,
+            date_creation=datetime.now(),
+            date_modification=datetime.now(),
+            assignee_a_id=assigned_user_id
+        )
+        
+        db.add(new_plainte)
+        db.commit()
+        db.refresh(new_plainte)
+        
+        logger.info(f"✅ Plainte créée: {new_plainte.numero_plainte} (ID: {new_plainte.id})")
+        
+        # Déterminer le type MIME
+        mime_types = {
+            '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+            '.png': 'image/png', '.webp': 'image/webp',
+            '.tiff': 'image/tiff', '.bmp': 'image/bmp', '.gif': 'image/gif'
+        }
+        mime_type = mime_types.get(file_ext, 'image/jpeg')
+        
+        # Enregistrement du document Image
+        doc_record = DocumentPlainte(
+            plainte_id=new_plainte.id,
+            nom_fichier=image_file.filename,
+            nom_stockage=nom_stockage,
+            chemin_fichier=str(file_path),
+            type_fichier=TypeFichier.IMAGE,
+            taille_fichier=len(content),
+            mime_type=mime_type,
+            description="Image originale de la plainte (document source OCR)",
+            est_piece_jointe_originale=True
+        )
+        db.add(doc_record)
+        db.commit()
+        
+        logger.info(f"📎 Document attaché: {image_file.filename}")
+        
+        # Lancer l'analyse IA en arrière-plan (optionnel)
+        background_tasks.add_task(launch_background_analysis, new_plainte.id)
+        
+        # Réponse
+        return JSONResponse(
+            content={
+                "success": True,
+                "message": "Plainte créée avec succès depuis l'image",
+                "plainte": {
+                    "id": new_plainte.id,
+                    "numero_plainte": new_plainte.numero_plainte,
+                    "titre": new_plainte.titre,
+                    "description": new_plainte.description[:500] + "..." if len(new_plainte.description) > 500 else new_plainte.description,
+                    "statut": new_plainte.statut.value,
+                    "priorite": new_plainte.priorite.value,
+                    "service_id": new_plainte.service_id,
+                    "service_nom": service.nom,
+                    "date_creation": new_plainte.date_creation.isoformat()
+                },
+                "plaignant": {
+                    "nom": new_plainte.nom_plaignant,
+                    "prenom": new_plainte.prenom_plaignant,
+                    "email": new_plainte.email_plaignant,
+                    "telephone": new_plainte.telephone_plaignant
+                },
+                "document": {
+                    "nom_fichier": image_file.filename,
+                    "taille": len(content),
+                    "chemin_stockage": str(file_path),
+                    "type": "image"
+                },
+                "analyse_ia": {
+                    "statut": "en_cours",
+                    "message": "Analyse IA en cours en arrière-plan"
+                }
+            },
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                "Access-Control-Allow-Headers": "*"
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erreur création plainte depuis image validée: {e}")
         import traceback
         traceback.print_exc()
         db.rollback()
@@ -1760,6 +1959,173 @@ async def preview_image_extraction(
         raise
     except Exception as e:
         logger.error(f"❌ Erreur prévisualisation image: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la prévisualisation: {str(e)}")
+
+
+# ==================== PRÉVISUALISATION IMAGE ASYNCHRONE ====================
+
+@router.post("/depuis-image/preview-async")
+async def preview_image_extraction_async(
+    image_file: UploadFile = File(..., description="Image à analyser de manière asynchrone"),
+    db: Session = Depends(get_db)
+):
+    """
+    Lance l'extraction des données d'une image de manière ASYNCHRONE.
+    Retourne immédiatement un task_id. Le résultat sera envoyé via WebSocket.
+    
+    Workflow:
+    1. Upload de l'image et sauvegarde temporaire
+    2. Retour immédiat avec task_id
+    3. OCR + Analyse IA en arrière-plan (Celery worker)
+    4. Notification WebSocket quand terminé (événement 'image_extraction_complete')
+    
+    Returns:
+        task_id pour suivre le traitement et recevoir les résultats via WebSocket
+    """
+    import uuid
+    
+    try:
+        logger.info(f"📷 [Async] Prévisualisation Image: {image_file.filename}")
+        
+        # Vérification du type de fichier
+        allowed_extensions = ['.jpg', '.jpeg', '.png', '.webp', '.tiff', '.bmp', '.gif']
+        file_ext = Path(image_file.filename).suffix.lower()
+        
+        if file_ext not in allowed_extensions:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Format d'image non supporté. Formats acceptés: {', '.join(allowed_extensions)}"
+            )
+        
+        # Lecture du contenu
+        content = await image_file.read()
+        if len(content) > 15 * 1024 * 1024:  # 15 MB pour les images
+            raise HTTPException(
+                status_code=400, 
+                detail="L'image ne doit pas dépasser 15 MB"
+            )
+        
+        # Générer un task_id unique
+        task_id = str(uuid.uuid4())
+        
+        # Sauvegarde temporaire pour l'analyse OCR par le worker
+        temp_dir = Path("data/temp")
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_path = temp_dir / f"async_{task_id}_{image_file.filename}"
+        
+        with open(temp_path, "wb") as buffer:
+            buffer.write(content)
+        
+        logger.info(f"📁 [Async] Image sauvegardée temporairement: {temp_path}")
+        
+        # Récupérer la liste des services disponibles (pour le frontend)
+        services = db.query(Service).filter(Service.est_actif == True).all()
+        services_list = [{"id": s.id, "nom": s.nom, "code": s.code_service} for s in services]
+        
+        # Lancer la tâche Celery pour l'OCR + analyse IA
+        try:
+            from healthcare_worker_server.app.tasks.celery_tasks import extract_image_data_async
+            celery_task = extract_image_data_async.delay(task_id, str(temp_path), image_file.filename)
+            logger.info(f"🚀 [Async] Tâche Celery lancée: {celery_task.id}")
+            
+            return JSONResponse(content={
+                "success": True,
+                "async": True,
+                "task_id": task_id,
+                "celery_task_id": celery_task.id,
+                "filename": image_file.filename,
+                "file_size": len(content),
+                "services_disponibles": services_list,
+                "message": "Analyse OCR et IA en cours. Vous recevrez le résultat via WebSocket (événement 'image_extraction_complete')."
+            })
+            
+        except Exception as celery_error:
+            logger.warning(f"⚠️ Celery non disponible: {celery_error}. Extraction synchrone de secours.")
+            
+            # Fallback synchrone si Celery n'est pas disponible
+            try:
+                extracted_text = ""
+                ocr_confidence = 0.0
+                extracted_data = None
+                
+                # OCR synchrone
+                if IMAGE_OCR_AVAILABLE:
+                    ocr_service = get_ocr_service()
+                    ocr_result = ocr_service.extract_text_from_image(content, image_file.filename)
+                    
+                    if ocr_result["success"]:
+                        extracted_text = ocr_result["text"]
+                        ocr_confidence = ocr_result.get("confidence", 0.5)
+                else:
+                    # Fallback pytesseract
+                    from PIL import Image
+                    import pytesseract
+                    import io
+                    
+                    image = Image.open(io.BytesIO(content))
+                    extracted_text = pytesseract.image_to_string(image, config=r'--oem 3 --psm 6 -l fra+eng')
+                    ocr_confidence = 0.5
+                
+                # Analyse IA synchrone
+                if extracted_text and PDF_EXTRACTION_AVAILABLE:
+                    llm_service = get_llm_service()
+                    analysis_service = ComplaintAnalysisService(llm_provider=llm_service)
+                    analysis_result = analysis_service.extract_complaint_data_from_pdf(extracted_text)
+                    
+                    if analysis_result.success:
+                        extracted_data = json.loads(analysis_result.content)
+                    else:
+                        extracted_data = _extract_basic_data_from_text(extracted_text)
+                elif extracted_text:
+                    extracted_data = _extract_basic_data_from_text(extracted_text)
+                
+                # Ajuster le mode de réception
+                if extracted_data and extracted_data.get("plainte"):
+                    extracted_data["plainte"]["mode_reception"] = "photo_import"
+                
+                # Nettoyer le fichier temporaire
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
+                
+                return JSONResponse(content={
+                    "success": True,
+                    "async": False,  # Indique que c'est une réponse synchrone (fallback)
+                    "task_id": task_id,
+                    "filename": image_file.filename,
+                    "extraction": {
+                        "texte_brut": extracted_text[:3000] if len(extracted_text) > 3000 else extracted_text,
+                        "texte_longueur": len(extracted_text),
+                        "donnees_structurees": extracted_data
+                    },
+                    "ocr_info": {
+                        "confiance": ocr_confidence,
+                        "qualite": (
+                            "excellent" if ocr_confidence >= 0.8 else
+                            "bon" if ocr_confidence >= 0.6 else
+                            "moyen" if ocr_confidence >= 0.4 else
+                            "faible"
+                        )
+                    },
+                    "services_disponibles": services_list,
+                    "message": "Extraction réalisée de manière synchrone (Celery non disponible)."
+                })
+                
+            except Exception as sync_error:
+                # Nettoyer le fichier temporaire en cas d'erreur
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
+                raise HTTPException(status_code=500, detail=f"Erreur extraction synchrone: {str(sync_error)}")
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erreur prévisualisation image async: {e}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Erreur lors de la prévisualisation: {str(e)}")

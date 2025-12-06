@@ -124,7 +124,10 @@ sio = socketio.AsyncServer(
     async_mode='asgi',
     cors_allowed_origins='*',
     logger=True,
-    engineio_logger=False
+    engineio_logger=False,
+    ping_timeout=60,
+    ping_interval=25,
+    max_http_buffer_size=10 * 1024 * 1024,  # 10MB pour les gros fichiers
 )
 
 # Création de l'application FastAPI (inspirée d'ODYSSEE)
@@ -179,6 +182,23 @@ async def unsubscribe_task(sid, data):
     if task_id:
         await sio.leave_room(sid, f'task_{task_id}')
         logger.info(f"📝 Client {sid} désabonné de la tâche {task_id}")
+
+@sio.event
+async def subscribe_extraction(sid, data):
+    """S'abonner aux mises à jour d'une tâche d'extraction PDF/Image"""
+    task_id = data.get('task_id')
+    if task_id:
+        await sio.enter_room(sid, f'task_{task_id}')
+        logger.info(f"📄 Client {sid} abonné à l'extraction {task_id}")
+        await sio.emit('extraction_subscribed', {'task_id': task_id}, to=sid)
+
+@sio.event
+async def unsubscribe_extraction(sid, data):
+    """Se désabonner d'une tâche d'extraction"""
+    task_id = data.get('task_id')
+    if task_id:
+        await sio.leave_room(sid, f'task_{task_id}')
+        logger.info(f"📄 Client {sid} désabonné de l'extraction {task_id}")
 
 # Exporter le serveur Socket.IO pour utilisation dans d'autres modules
 def get_socketio_server():

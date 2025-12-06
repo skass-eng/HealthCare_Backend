@@ -551,20 +551,36 @@ def extract_pdf_data_async(self, task_id: str, pdf_text: str, filename: str):
     """
     logger.info(f"🔬 [Task {task_id}] Démarrage extraction PDF async: {filename}")
     
-    # Notifier le début du traitement
+    # Notifier le début du traitement - Étape 1: Réception
     notify_websocket("pdf_extraction_started", {
         "task_id": task_id,
         "filename": filename,
         "status": "processing",
-        "message": "Analyse IA en cours..."
+        "step": 1,
+        "message": "Fichier reçu, préparation de l'analyse..."
     })
     
     try:
         # Initialiser les services
         initialize_services()
         
+        # Notifier l'étape 2: Extraction du texte
+        notify_websocket("pdf_extraction_progress", {
+            "task_id": task_id,
+            "step": 2,
+            "message": "Extraction du texte en cours..."
+        })
+        
         # Extraire les données avec le service d'analyse IA
         logger.info(f"🤖 [Task {task_id}] Appel du service d'analyse IA...")
+        
+        # Notifier l'étape 3: Analyse IA
+        notify_websocket("pdf_extraction_progress", {
+            "task_id": task_id,
+            "step": 3,
+            "message": "Analyse IA des données..."
+        })
+        
         extraction_result = _analysis_service.extract_complaint_data_from_pdf(pdf_text)
         
         if extraction_result.success:
@@ -654,9 +670,9 @@ def extract_image_data_async(self, task_id: str, image_path: str, filename: str)
         from healthcare_worker_server.app.services.image_ocr import ImageOCRService
         ocr_service = ImageOCRService()
         
-        # 1. Extraire le texte via OCR
-        logger.info(f"🔍 [Task {task_id}] Extraction OCR...")
-        ocr_result = ocr_service.extract_text_from_image(image_path)
+        # 1. Extraire le texte via OCR (utiliser extract_text_from_file pour un chemin de fichier)
+        logger.info(f"🔍 [Task {task_id}] Extraction OCR depuis fichier: {image_path}")
+        ocr_result = ocr_service.extract_text_from_file(image_path)
         
         if not ocr_result.get("success"):
             raise Exception(ocr_result.get("error", "Échec OCR"))

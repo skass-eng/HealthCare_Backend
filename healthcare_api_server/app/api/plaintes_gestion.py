@@ -78,6 +78,11 @@ def get_plaintes(
             )
             query = query.filter(search_filter)
 
+        # Si aucune date n'est fournie, retourner uniquement les 3 derniers mois par défaut
+        if date_debut is None and date_fin is None:
+            date_debut = datetime.now() - timedelta(days=90)  # 3 mois par défaut
+            logger.info(f"📅 Aucune date fournie - Application du filtre par défaut: 3 derniers mois depuis {date_debut.date()}")
+        
         if date_debut:
             query = query.filter(Plainte.date_creation >= date_debut)
 
@@ -705,22 +710,52 @@ def get_analyses_plainte(
 # ==================== STATISTIQUES ====================
 
 @router.get("/statistiques/global", response_model=dict)
-def get_statistiques_globales(db: Session = Depends(get_db)):
+def get_statistiques_globales(
+    date_debut: Optional[datetime] = Query(None, description="Date de début (format: YYYY-MM-DD)"),
+    date_fin: Optional[datetime] = Query(None, description="Date de fin (format: YYYY-MM-DD)"),
+    db: Session = Depends(get_db)
+):
     """
-    Récupérer les statistiques globales des plaintes
+    Récupérer les statistiques globales des plaintes.
+    Si date_debut et date_fin sont fournis, les statistiques sont filtrées par cette période.
+    Sinon, retourne les statistiques des 3 derniers mois par défaut.
     """
     try:
-        # Compter par statut
-        stats_statut = db.query(
+        # Si aucune date n'est fournie, utiliser les 3 derniers mois par défaut
+        if date_debut is None and date_fin is None:
+            date_debut = datetime.now() - timedelta(days=90)
+            logger.info(f"📅 Statistiques: Aucune date fournie - Filtre par défaut: 3 derniers mois depuis {date_debut.date()}")
+        
+        # Log des filtres appliqués
+        logger.info(f"📅 Statistiques: Filtrage date_debut={date_debut}, date_fin={date_fin}")
+        
+        # Construction des filtres de dates
+        date_filters = []
+        if date_debut:
+            date_filters.append(Plainte.date_creation >= date_debut)
+        if date_fin:
+            date_fin_inclusive = date_fin + timedelta(days=1)
+            date_filters.append(Plainte.date_creation < date_fin_inclusive)
+        
+        # Compter par statut avec les filtres de dates
+        stats_query = db.query(
             Plainte.statut,
             func.count(Plainte.id).label('count')
-        ).group_by(Plainte.statut).all()
+        )
+        if date_filters:
+            stats_query = stats_query.filter(and_(*date_filters))
+        stats_statut = stats_query.group_by(Plainte.statut).all()
 
         # Convertir en dictionnaire pour accès facile
         stats_dict = {stat.statut.value: stat.count for stat in stats_statut}
+        
+        logger.info(f"📊 Statistiques calculées: {stats_dict}")
 
-        # Total des plaintes
-        total = db.query(func.count(Plainte.id)).scalar()
+        # Total des plaintes (filtré par dates)
+        total_query = db.query(func.count(Plainte.id))
+        if date_filters:
+            total_query = total_query.filter(and_(*date_filters))
+        total = total_query.scalar() or 0
 
         # Plaintes du mois en cours
         debut_mois = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)

@@ -34,13 +34,18 @@ def main():
         from healthcare_api_server.app.main import app
         
         print("🚀 Démarrage du serveur API...")
-        uvicorn.run(
+        
+        # Configuration uvicorn
+        config = uvicorn.Config(
             "healthcare_api_server.app.main:app" if args.reload else app,
             host=args.host,
             port=args.port,
             reload=args.reload,
-            log_level="info"
+            log_level="info",
         )
+        
+        server = uvicorn.Server(config)
+        server.run()
     except KeyboardInterrupt:
         print("\n⏹️  Arrêt du serveur API")
     except Exception as e:
