@@ -844,12 +844,32 @@ def get_evolution_plaintes(
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/statistiques/departements", response_model=List[dict])
-def get_statistiques_departements(db: Session = Depends(get_db)):
+def get_statistiques_departements(
+    date_debut: Optional[datetime] = Query(None, description="Date de début (format: YYYY-MM-DD)"),
+    date_fin: Optional[datetime] = Query(None, description="Date de fin (format: YYYY-MM-DD)"),
+    db: Session = Depends(get_db)
+):
     """
     Récupérer les statistiques par département/service
     Inclut tous les services, même ceux sans plaintes
+    Si date_debut et date_fin sont fournis, les statistiques sont filtrées par cette période.
     """
     try:
+        # Si aucune date n'est fournie, utiliser les 3 derniers mois par défaut
+        if date_debut is None and date_fin is None:
+            date_debut = datetime.now() - timedelta(days=90)
+            logger.info(f"📅 Stats départements: Filtre par défaut 3 derniers mois depuis {date_debut.date()}")
+        
+        # Construction des conditions de jointure avec filtres de dates
+        join_conditions = [Service.id == Plainte.service_id]
+        if date_debut:
+            join_conditions.append(Plainte.date_creation >= date_debut)
+        if date_fin:
+            date_fin_inclusive = date_fin + timedelta(days=1)
+            join_conditions.append(Plainte.date_creation < date_fin_inclusive)
+        
+        logger.info(f"📅 Stats départements: date_debut={date_debut}, date_fin={date_fin}")
+        
         # Récupérer les statistiques par service avec LEFT JOIN pour inclure tous les services
         stats_services = db.query(
             Service.id,
@@ -862,7 +882,7 @@ def get_statistiques_departements(db: Session = Depends(get_db)):
             func.sum(case((Plainte.statut == StatutPlainte.CLOTURE, 1), else_=0)).label('cloturees'),
             func.avg(Plainte.score_sentiment).label('satisfaction_moyenne')
         ).outerjoin(
-            Plainte, Service.id == Plainte.service_id
+            Plainte, and_(*join_conditions)
         ).filter(
             Service.est_actif == True
         ).group_by(
