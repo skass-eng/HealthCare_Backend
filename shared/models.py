@@ -499,3 +499,41 @@ class DocumentPlainte(Base):
         Index('idx_document_plainte', 'plainte_id'),
         Index('idx_document_type', 'type_fichier'),
     )
+
+
+class AIAnalysisResult(Base):
+    """
+    Stockage des résultats d'analyse IA
+    Permet de conserver l'historique des analyses et d'afficher la dernière analyse
+    """
+    __tablename__ = "ai_analysis_results"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String(100), unique=True, nullable=False)  # UUID de la tâche
+    
+    # Informations de l'analyse
+    total_plaintes_analysees = Column(Integer, default=0)
+    nombre_services = Column(Integer, default=0)
+    model_used = Column(String(100))  # Modèle Ollama utilisé
+    
+    # Résultats JSON
+    analyses_par_service = Column(JSONB)  # Liste des analyses par service
+    causes_globales = Column(JSONB)  # Top causes identifiées
+    services_critiques = Column(JSONB)  # Liste des services critiques
+    
+    # Statut
+    status = Column(String(50), default='completed')  # pending, running, completed, error
+    error_message = Column(Text)
+    
+    # Dates
+    started_at = Column(DateTime, nullable=False, server_default=func.now())
+    completed_at = Column(DateTime)
+    
+    # Métadonnées
+    duree_secondes = Column(Float)  # Durée de l'analyse en secondes
+    
+    # Index pour performance
+    __table_args__ = (
+        Index('idx_ai_analysis_date', 'completed_at'),
+        Index('idx_ai_analysis_status', 'status'),
+    )

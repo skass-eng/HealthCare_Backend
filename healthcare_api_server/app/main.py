@@ -200,6 +200,23 @@ async def unsubscribe_extraction(sid, data):
         await sio.leave_room(sid, f'task_{task_id}')
         logger.info(f"📄 Client {sid} désabonné de l'extraction {task_id}")
 
+@sio.event
+async def subscribe_ai_analysis(sid, data):
+    """S'abonner aux mises à jour d'une tâche d'analyse IA"""
+    task_id = data.get('task_id')
+    if task_id:
+        await sio.enter_room(sid, f'task_{task_id}')
+        logger.info(f"🧠 Client {sid} abonné à l'analyse IA {task_id}")
+        await sio.emit('ai_analysis_subscribed', {'task_id': task_id}, to=sid)
+
+@sio.event
+async def unsubscribe_ai_analysis(sid, data):
+    """Se désabonner d'une tâche d'analyse IA"""
+    task_id = data.get('task_id')
+    if task_id:
+        await sio.leave_room(sid, f'task_{task_id}')
+        logger.info(f"🧠 Client {sid} désabonné de l'analyse IA {task_id}")
+
 # Exporter le serveur Socket.IO pour utilisation dans d'autres modules
 def get_socketio_server():
     return sio

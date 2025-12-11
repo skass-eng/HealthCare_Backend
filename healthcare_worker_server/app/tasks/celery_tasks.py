@@ -536,7 +536,7 @@ def notify_websocket(event_type: str, data: Dict[str, Any]):
 
 
 @app.task(bind=True, name="extract_pdf_data_async")
-def extract_pdf_data_async(self, task_id: str, pdf_text: str, filename: str):
+def extract_pdf_data_async(self, task_id: str, pdf_text: str, filename: str, temp_file_path: str = None):
     """
     Tâche asynchrone pour extraire les données d'un PDF via IA.
     Envoie le résultat via WebSocket quand terminé.
@@ -545,6 +545,7 @@ def extract_pdf_data_async(self, task_id: str, pdf_text: str, filename: str):
         task_id: Identifiant unique de la tâche (pour le frontend)
         pdf_text: Texte extrait du PDF
         filename: Nom du fichier original
+        temp_file_path: Chemin vers le fichier PDF temporaire (pour création plainte)
     
     Returns:
         Dict avec les données extraites
@@ -594,6 +595,7 @@ def extract_pdf_data_async(self, task_id: str, pdf_text: str, filename: str):
                 "success": True,
                 "task_id": task_id,
                 "filename": filename,
+                "temp_file_path": temp_file_path,  # Chemin du fichier temp pour création plainte
                 "extraction": {
                     "donnees_structurees": extracted_data,
                     "texte_brut": pdf_text[:2000],  # Limiter la taille
@@ -603,7 +605,7 @@ def extract_pdf_data_async(self, task_id: str, pdf_text: str, filename: str):
                 "message": "Extraction réussie"
             }
             
-            logger.info(f"✅ [Task {task_id}] Extraction réussie avec confiance {extraction_result.confidence}")
+            logger.info(f"✅ [Task {task_id}] Extraction réussie avec confiance {extraction_result.confidence}. Fichier temp: {temp_file_path}")
             
             # Notifier le succès via WebSocket
             notify_websocket("pdf_extraction_complete", result)
@@ -652,6 +654,8 @@ def extract_image_data_async(self, task_id: str, image_path: str, filename: str)
         task_id: Identifiant unique de la tâche
         image_path: Chemin vers l'image temporaire
         filename: Nom du fichier original
+    
+    Note: Le fichier temp n'est PAS supprimé ici - il sera utilisé pour créer la plainte
     """
     logger.info(f"📷 [Task {task_id}] Démarrage extraction image async: {filename}")
     
@@ -694,6 +698,7 @@ def extract_image_data_async(self, task_id: str, image_path: str, filename: str)
                 "success": True,
                 "task_id": task_id,
                 "filename": filename,
+                "temp_file_path": image_path,  # Chemin du fichier temp pour création plainte
                 "extraction": {
                     "donnees_structurees": extracted_data,
                     "texte_brut": ocr_text[:2000],
@@ -707,7 +712,7 @@ def extract_image_data_async(self, task_id: str, image_path: str, filename: str)
                 "message": "Extraction réussie"
             }
             
-            logger.info(f"✅ [Task {task_id}] Extraction image réussie")
+            logger.info(f"✅ [Task {task_id}] Extraction image réussie. Fichier temp conservé: {image_path}")
             notify_websocket("image_extraction_complete", result)
             
             return result
@@ -726,14 +731,17 @@ def extract_image_data_async(self, task_id: str, image_path: str, filename: str)
         }
         
         notify_websocket("image_extraction_failed", error_result)
-        return error_result
-    finally:
-        # Nettoyer le fichier temporaire
+        
+        # En cas d'erreur, on peut supprimer le fichier temp
         try:
             if os.path.exists(image_path):
                 os.remove(image_path)
+                logger.info(f"🗑️ [Task {task_id}] Fichier temp supprimé après erreur")
         except:
             pass
+        
+        return error_result
+    # Note: PAS de finally avec suppression - le fichier est conservé pour créer la plainte
 
 
 if __name__ == '__main__':

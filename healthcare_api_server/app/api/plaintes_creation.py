@@ -1606,22 +1606,27 @@ async def preview_pdf_extraction_async(
                         page_text = page.extract_text()
                         if page_text:
                             extracted_text += page_text + "\n"
-        finally:
-            # Nettoyer le fichier temporaire
+        except Exception as extract_error:
+            logger.error(f"❌ Erreur extraction texte PDF: {extract_error}")
+            # Nettoyer si erreur
             try:
                 os.remove(temp_path)
             except:
                 pass
+            raise HTTPException(status_code=400, detail="Impossible d'extraire le texte du PDF")
+        
+        # Note: On garde le fichier temp pour l'utiliser lors de la création de la plainte
+        # Il sera supprimé après la création de la plainte
         
         if not extracted_text:
             raise HTTPException(status_code=400, detail="Impossible d'extraire le texte du PDF")
         
         logger.info(f"📝 [Async] Texte extrait: {len(extracted_text)} caractères")
         
-        # Lancer la tâche Celery pour l'analyse IA
+        # Lancer la tâche Celery pour l'analyse IA (passer aussi le temp_path)
         try:
             from healthcare_worker_server.app.tasks.celery_tasks import extract_pdf_data_async
-            celery_task = extract_pdf_data_async.delay(task_id, extracted_text, pdf_file.filename)
+            celery_task = extract_pdf_data_async.delay(task_id, extracted_text, pdf_file.filename, str(temp_path))
             logger.info(f"🚀 [Async] Tâche Celery lancée: {celery_task.id}")
         except Exception as celery_error:
             logger.warning(f"⚠️ Celery non disponible: {celery_error}. Extraction synchrone de secours.")
@@ -1645,6 +1650,7 @@ async def preview_pdf_extraction_async(
                     "async": False,  # Indique que c'est une réponse synchrone (fallback)
                     "task_id": task_id,
                     "filename": pdf_file.filename,
+                    "temp_file_path": str(temp_path),  # Chemin du fichier temp
                     "extraction": {
                         "texte_brut": extracted_text[:3000],
                         "texte_longueur": len(extracted_text),
@@ -1661,7 +1667,7 @@ async def preview_pdf_extraction_async(
         services = db.query(Service).filter(Service.est_actif == True).all()
         services_list = [{"id": s.id, "nom": s.nom, "code": s.code_service} for s in services]
         
-        # Retourner immédiatement avec le task_id
+        # Retourner immédiatement avec le task_id et le chemin du fichier temp
         return JSONResponse(content={
             "success": True,
             "async": True,
@@ -1670,6 +1676,7 @@ async def preview_pdf_extraction_async(
             "filename": pdf_file.filename,
             "file_size": len(content),
             "text_length": len(extracted_text),
+            "temp_file_path": str(temp_path),  # Chemin du fichier temp pour création plainte
             "services_disponibles": services_list,
             "message": "Analyse IA en cours. Vous serez notifié via WebSocket quand elle sera terminée.",
             "websocket_events": {
@@ -2407,3 +2414,178 @@ async def create_complaint_from_image(
         traceback.print_exc()
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Erreur lors de la création de la plainte depuis l'image: {str(e)}")
+
+
+# ==================== CRÉATION PLAINTE DEPUIS FICHIER TEMPORAIRE ====================
+
+@router.post("/depuis-temp")
+async def create_plainte_from_temp_file(
+    temp_file_path: str = Form(..., description="Chemin du fichier temporaire sur le serveur"),
+    file_type: str = Form(..., description="Type de fichier: 'pdf' ou 'image'"),
+    service_id: int = Form(..., description="ID du service concerné"),
+    titre: str = Form(..., description="Titre de la plainte"),
+    description: str = Form(..., description="Description de la plainte"),
+    nom_plaignant: str = Form(..., description="Nom du plaignant"),
+    prenom_plaignant: str = Form(..., description="Prénom du plaignant"),
+    email_plaignant: Optional[str] = Form(None, description="Email du plaignant"),
+    telephone_plaignant: Optional[str] = Form(None, description="Téléphone du plaignant"),
+    mode_reception: Optional[str] = Form("document_import", description="Mode de réception"),
+    date_incident: Optional[str] = Form(None, description="Date de l'incident"),
+    priorite: Optional[str] = Form("MOYEN", description="Priorité"),
+    assigned_user_id: Optional[int] = Form(None, description="ID de l'utilisateur assigné"),
+    db: Session = Depends(get_db)
+):
+    """
+    Crée une plainte à partir d'un fichier temporaire déjà uploadé et analysé.
+    
+    Ce endpoint est utilisé quand l'utilisateur a navigué pendant le traitement OCR/IA
+    et revient pour créer la plainte. Le fichier est récupéré depuis le dossier temp.
+    
+    Args:
+        temp_file_path: Chemin vers le fichier temporaire (data/temp/async_xxx_filename.ext)
+        file_type: 'pdf' ou 'image'
+        service_id: ID du service concerné
+        ... autres champs du formulaire
+    
+    Returns:
+        Plainte créée avec document attaché
+    """
+    try:
+        logger.info(f"📁 Création plainte depuis fichier temp: {temp_file_path}")
+        
+        # Vérifier que le fichier temp existe
+        temp_path = Path(temp_file_path)
+        if not temp_path.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"Le fichier temporaire n'existe plus. Veuillez re-uploader le document."
+            )
+        
+        # Vérifier que le fichier est bien dans le dossier temp (sécurité)
+        allowed_temp_dirs = [Path("data/temp"), Path("./data/temp")]
+        is_valid_path = any(
+            str(temp_path.resolve()).startswith(str(allowed_dir.resolve()))
+            for allowed_dir in allowed_temp_dirs
+            if allowed_dir.exists()
+        )
+        
+        if not is_valid_path and "data/temp" not in str(temp_path):
+            raise HTTPException(
+                status_code=403,
+                detail="Accès non autorisé à ce fichier"
+            )
+        
+        # Lire le contenu du fichier
+        with open(temp_path, "rb") as f:
+            content = f.read()
+        
+        # Récupérer le nom de fichier original (sans le préfixe async_uuid_)
+        original_filename = temp_path.name
+        if original_filename.startswith("async_"):
+            # Format: async_{task_id}_{original_filename}
+            parts = original_filename.split("_", 2)
+            if len(parts) >= 3:
+                original_filename = parts[2]
+        
+        logger.info(f"📄 Fichier récupéré: {original_filename} ({len(content)} bytes)")
+        
+        # Vérifier le service
+        service = db.query(Service).filter(Service.id == service_id).first()
+        if not service:
+            service = db.query(Service).first()
+            if not service:
+                raise HTTPException(status_code=400, detail="Aucun service disponible")
+        
+        # Créer la plainte
+        numero_plainte = generate_numero_plainte(db)
+        
+        new_plainte = Plainte(
+            numero_plainte=numero_plainte,
+            objet=titre,
+            description=description,
+            statut=StatutPlainte.NOUVELLE,
+            priorite=Priorite(priorite.upper()) if priorite else Priorite.MOYEN,
+            source=SourcePlainte.DIGITAL,
+            service_concerne_id=service.id,
+            utilisateur_assigne_id=assigned_user_id if assigned_user_id else None,
+            date_incident=datetime.strptime(date_incident, "%Y-%m-%d") if date_incident else None,
+            nom_plaignant=nom_plaignant,
+            prenom_plaignant=prenom_plaignant,
+            email_plaignant=email_plaignant,
+            telephone_plaignant=telephone_plaignant,
+            mode_reception=mode_reception or ("pdf_import" if file_type == "pdf" else "photo_import")
+        )
+        
+        db.add(new_plainte)
+        db.flush()
+        
+        # Déterminer le dossier de destination
+        if file_type == "image":
+            docs_dir = Path("data/documents/images_originales")
+        else:
+            docs_dir = Path("data/documents/pdf_originaux")
+        
+        docs_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Nom de fichier final avec numéro de plainte
+        safe_filename = original_filename.replace(" ", "_").replace("/", "_").replace("\\", "_")
+        final_filename = f"{numero_plainte}_{safe_filename}"
+        file_path = docs_dir / final_filename
+        
+        # Déplacer le fichier temp vers le dossier documents
+        import shutil
+        shutil.move(str(temp_path), str(file_path))
+        logger.info(f"📂 Fichier déplacé: {temp_path} → {file_path}")
+        
+        # Créer le document associé
+        document = Document(
+            plainte_id=new_plainte.id,
+            nom_fichier=original_filename,
+            type_document="pdf" if file_type == "pdf" else "image",
+            chemin_stockage=str(file_path),
+            taille=len(content),
+            date_upload=datetime.utcnow()
+        )
+        
+        db.add(document)
+        db.commit()
+        db.refresh(new_plainte)
+        
+        logger.info(f"✅ Plainte {numero_plainte} créée depuis fichier temp")
+        
+        return JSONResponse(content={
+            "success": True,
+            "message": f"Plainte {numero_plainte} créée avec succès",
+            "plainte": {
+                "id": new_plainte.id,
+                "numero_plainte": numero_plainte,
+                "titre": titre,
+                "description": description[:200] + "..." if len(description) > 200 else description,
+                "statut": new_plainte.statut.value if hasattr(new_plainte.statut, 'value') else str(new_plainte.statut),
+                "priorite": new_plainte.priorite.value if hasattr(new_plainte.priorite, 'value') else str(new_plainte.priorite),
+                "service_id": service.id,
+                "service_nom": service.nom,
+                "date_creation": new_plainte.date_creation.isoformat() if new_plainte.date_creation else None
+            },
+            "plaignant": {
+                "nom": nom_plaignant,
+                "prenom": prenom_plaignant,
+                "email": email_plaignant,
+                "telephone": telephone_plaignant
+            },
+            "document": {
+                "nom_fichier": original_filename,
+                "taille": len(content),
+                "chemin_stockage": str(file_path),
+                "type": file_type
+            }
+        })
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erreur création plainte depuis fichier temp: {e}")
+        import traceback
+        traceback.print_exc()
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
