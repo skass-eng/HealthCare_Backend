@@ -72,6 +72,56 @@ def get_type_fichier(filename: str) -> TypeFichier:
     }
     return mapping.get(ext, TypeFichier.AUTRE)
 
+
+def generate_numero_plainte(db: Session) -> str:
+    """
+    Génère un numéro de plainte unique et robuste.
+    Utilise MAX au lieu de COUNT pour éviter les doublons après suppression.
+    Inclut une vérification de sécurité pour les conditions de concurrence.
+    
+    Format: PL_YYYY_XXXX (ex: PL_2025_0148)
+    
+    Args:
+        db: Session de base de données
+    
+    Returns:
+        Numéro de plainte unique
+    """
+    current_year = datetime.now().year
+    prefix = f"PL_{current_year}_"
+    
+    # Trouver le dernier numéro utilisé pour cette année
+    last_plainte = db.query(Plainte.numero_plainte).filter(
+        Plainte.numero_plainte.like(f"{prefix}%")
+    ).order_by(Plainte.numero_plainte.desc()).first()
+    
+    if last_plainte and last_plainte[0]:
+        try:
+            last_num = int(last_plainte[0].replace(prefix, ""))
+            next_num = last_num + 1
+        except ValueError:
+            next_num = 1
+    else:
+        next_num = 1
+    
+    numero_plainte = f"{prefix}{str(next_num).zfill(4)}"
+    
+    # Vérification de sécurité: s'assurer que le numéro n'existe pas déjà
+    max_attempts = 100  # Éviter boucle infinie
+    attempts = 0
+    while db.query(Plainte).filter(Plainte.numero_plainte == numero_plainte).first() and attempts < max_attempts:
+        next_num += 1
+        numero_plainte = f"{prefix}{str(next_num).zfill(4)}"
+        attempts += 1
+    
+    if attempts >= max_attempts:
+        # Fallback: utiliser un UUID partiel pour garantir l'unicité
+        import uuid
+        numero_plainte = f"{prefix}{str(uuid.uuid4())[:8].upper()}"
+    
+    logger.info(f"📝 Numéro de plainte généré: {numero_plainte}")
+    return numero_plainte
+
 # Import du nouveau système modulaire
 try:
     from healthcare_worker_server.app.tasks.celery_tasks import process_complaint_complete
@@ -556,13 +606,8 @@ async def create_new_complaint(
         except ValueError:
             raise HTTPException(status_code=400, detail="Format de date invalide (YYYY-MM-DD attendu)")
         
-        # Génération du numéro de plainte
-        current_year = datetime.now().year
-        total_count = db.query(func.count(Plainte.id)).filter(
-            func.extract('year', Plainte.date_creation) == current_year
-        ).scalar() or 0
-        
-        numero_plainte = f"PL_{current_year}_{str(total_count + 1).zfill(4)}"
+        # Génération du numéro de plainte (utilise la fonction robuste)
+        numero_plainte = generate_numero_plainte(db)
         
         # Traitement des documents - Sauvegarde sur disque
         documents_info = []  # Liste pour stocker les infos des documents
@@ -941,12 +986,8 @@ async def create_complaint_from_validated_data(
         if not service:
             raise HTTPException(status_code=404, detail=f"Service ID {service_id} non trouvé")
         
-        # Génération du numéro de plainte
-        current_year = datetime.now().year
-        total_count = db.query(func.count(Plainte.id)).filter(
-            func.extract('year', Plainte.date_creation) == current_year
-        ).scalar() or 0
-        numero_plainte = f"PL_{current_year}_{str(total_count + 1).zfill(4)}"
+        # Génération du numéro de plainte (utilise la fonction robuste)
+        numero_plainte = generate_numero_plainte(db)
         
         # Sauvegarde du PDF original
         upload_dir = Path("data/documents/pdf_originaux")
@@ -1131,12 +1172,8 @@ async def create_complaint_from_image_validated_data(
         if not service:
             raise HTTPException(status_code=404, detail=f"Service ID {service_id} non trouvé")
         
-        # Génération du numéro de plainte
-        current_year = datetime.now().year
-        total_count = db.query(func.count(Plainte.id)).filter(
-            func.extract('year', Plainte.date_creation) == current_year
-        ).scalar() or 0
-        numero_plainte = f"PL_{current_year}_{str(total_count + 1).zfill(4)}"
+        # Génération du numéro de plainte (utilise la fonction robuste)
+        numero_plainte = generate_numero_plainte(db)
         
         # Sauvegarde de l'image originale
         upload_dir = Path("data/documents/images_originales")
@@ -1312,12 +1349,8 @@ async def create_complaint_from_pdf(
                 detail="Le fichier PDF ne doit pas dépasser 10 MB"
             )
         
-        # Génération du numéro de plainte
-        current_year = datetime.now().year
-        total_count = db.query(func.count(Plainte.id)).filter(
-            func.extract('year', Plainte.date_creation) == current_year
-        ).scalar() or 0
-        numero_plainte = f"PL_{current_year}_{str(total_count + 1).zfill(4)}"
+        # Génération du numéro de plainte (utilise la fonction robuste)
+        numero_plainte = generate_numero_plainte(db)
         
         # Sauvegarde du PDF original
         upload_dir = Path("data/documents/pdf_originaux")
@@ -2044,6 +2077,7 @@ async def preview_image_extraction_async(
                 "celery_task_id": celery_task.id,
                 "filename": image_file.filename,
                 "file_size": len(content),
+                "temp_file_path": str(temp_path),  # Chemin du fichier temp pour création plainte
                 "services_disponibles": services_list,
                 "message": "Analyse OCR et IA en cours. Vous recevrez le résultat via WebSocket (événement 'image_extraction_complete')."
             })
@@ -2191,12 +2225,8 @@ async def create_complaint_from_image(
                 detail="L'image ne doit pas dépasser 15 MB"
             )
         
-        # Génération du numéro de plainte
-        current_year = datetime.now().year
-        total_count = db.query(func.count(Plainte.id)).filter(
-            func.extract('year', Plainte.date_creation) == current_year
-        ).scalar() or 0
-        numero_plainte = f"PL_{current_year}_{str(total_count + 1).zfill(4)}"
+        # Génération du numéro de plainte (utilise la fonction robuste)
+        numero_plainte = generate_numero_plainte(db)
         
         # Sauvegarde de l'image originale
         upload_dir = Path("data/documents/images_originales")
@@ -2496,19 +2526,48 @@ async def create_plainte_from_temp_file(
             if not service:
                 raise HTTPException(status_code=400, detail="Aucun service disponible")
         
-        # Créer la plainte
-        numero_plainte = generate_numero_plainte(db)
+        # Génération du numéro de plainte (robuste avec MAX au lieu de COUNT)
+        current_year = datetime.now().year
+        prefix = f"PL_{current_year}_"
+        
+        # Trouver le dernier numéro utilisé pour cette année
+        last_plainte = db.query(Plainte.numero_plainte).filter(
+            Plainte.numero_plainte.like(f"{prefix}%")
+        ).order_by(Plainte.numero_plainte.desc()).first()
+        
+        if last_plainte and last_plainte[0]:
+            try:
+                last_num = int(last_plainte[0].replace(prefix, ""))
+                next_num = last_num + 1
+            except ValueError:
+                next_num = 1
+        else:
+            next_num = 1
+        
+        numero_plainte = f"{prefix}{str(next_num).zfill(4)}"
+        
+        # Vérification de sécurité: s'assurer que le numéro n'existe pas déjà
+        while db.query(Plainte).filter(Plainte.numero_plainte == numero_plainte).first():
+            next_num += 1
+            numero_plainte = f"{prefix}{str(next_num).zfill(4)}"
+        
+        # Convertir la priorité
+        priorite_enum = PrioritePlainte.MOYEN
+        if priorite:
+            try:
+                priorite_enum = PrioritePlainte(priorite.upper())
+            except ValueError:
+                priorite_enum = PrioritePlainte.MOYEN
         
         new_plainte = Plainte(
             numero_plainte=numero_plainte,
-            objet=titre,
+            titre=titre,
             description=description,
-            statut=StatutPlainte.NOUVELLE,
-            priorite=Priorite(priorite.upper()) if priorite else Priorite.MOYEN,
-            source=SourcePlainte.DIGITAL,
-            service_concerne_id=service.id,
-            utilisateur_assigne_id=assigned_user_id if assigned_user_id else None,
-            date_incident=datetime.strptime(date_incident, "%Y-%m-%d") if date_incident else None,
+            statut=StatutPlainte.RECU,
+            priorite=priorite_enum,
+            service_id=service.id,
+            assignee_a_id=assigned_user_id if assigned_user_id else None,
+            date_incident=datetime.strptime(date_incident, "%Y-%m-%d").date() if date_incident else None,
             nom_plaignant=nom_plaignant,
             prenom_plaignant=prenom_plaignant,
             email_plaignant=email_plaignant,
@@ -2537,14 +2596,22 @@ async def create_plainte_from_temp_file(
         shutil.move(str(temp_path), str(file_path))
         logger.info(f"📂 Fichier déplacé: {temp_path} → {file_path}")
         
+        # Déterminer le type de fichier
+        type_fichier = TypeFichier.AUTRE
+        if file_type == "pdf":
+            type_fichier = TypeFichier.PDF
+        elif file_type == "image":
+            type_fichier = TypeFichier.IMAGE
+        
         # Créer le document associé
-        document = Document(
+        document = DocumentPlainte(
             plainte_id=new_plainte.id,
             nom_fichier=original_filename,
-            type_document="pdf" if file_type == "pdf" else "image",
-            chemin_stockage=str(file_path),
-            taille=len(content),
-            date_upload=datetime.utcnow()
+            nom_stockage=final_filename,
+            chemin_fichier=str(file_path),
+            type_fichier=type_fichier,
+            taille_fichier=len(content),
+            est_piece_jointe_originale=True
         )
         
         db.add(document)
