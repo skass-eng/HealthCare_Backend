@@ -27,6 +27,7 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
 import mimetypes
 
 from ..db.database import get_db
+from ..core.config import settings
 from shared.models import Plainte, User, Service, Analyse, StatutPlainte, PrioritePlainte, AnalyseIA, DocumentPlainte, TypeFichier
 from shared.schemas import (
     PlainteCreate, PlainteUpdate, PlainteResponse,
@@ -479,6 +480,25 @@ async def launch_background_analysis(plainte_id: int):
                 analyse_ia.mots_cles_detectes = json.dumps(["plainte", "service", "patient"])
                 analyse_ia.statut_analyse = "complete"
                 analyse_ia.date_analyse = datetime.now()
+                
+                # Générer une réponse suggérée automatique
+                nom_plaignant = plainte.nom_plaignant or "Patient"
+                prenom_plaignant = plainte.prenom_plaignant or ""
+                nom_complet = f"{prenom_plaignant} {nom_plaignant}".strip()
+                
+                analyse_ia.reponse_suggeree = f"""Cher(e) {nom_complet},
+
+Nous avons bien reçu votre plainte et nous vous remercions de nous avoir fait part de votre préoccupation.
+
+Après analyse de votre dossier, nous avons identifié un sentiment {sentiment} et avons classé cette plainte avec une priorité {priorite_ia}.
+
+Votre demande a été transmise au {service_suggere} pour un traitement approprié. Un responsable vous contactera dans les meilleurs délais pour un suivi personnalisé.
+
+Nous vous prions d'accepter nos excuses pour tout désagrément que vous auriez pu subir et vous assurons de notre engagement à améliorer la qualité de nos services.
+
+Cordialement,
+Le Service Qualité"""
+                
                 db.commit()
                 logger.info(f"✅ Analyse IA simulée terminée pour plainte {plainte_id}: {sentiment}/{priorite_ia}")
         
@@ -542,10 +562,12 @@ def get_default_service(db: Session = Depends(get_db)):
 @router.options("/nouvelle")
 async def options_create_complaint():
     """Endpoint OPTIONS pour CORS preflight"""
+    # Utiliser la première origine autorisée ou toutes si plusieurs
+    allowed_origins = ",".join(settings.BACKEND_CORS_ORIGINS)
     return JSONResponse(
         content={},
         headers={
-            "Access-Control-Allow-Origin": "http://localhost:3000",
+            "Access-Control-Allow-Origin": settings.BACKEND_CORS_ORIGINS[0] if settings.BACKEND_CORS_ORIGINS else "*",
             "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
             "Access-Control-Allow-Headers": "*",
             "Access-Control-Allow-Credentials": "true"
@@ -728,7 +750,7 @@ async def create_new_complaint(
         return JSONResponse(
             content=response_data,
             headers={
-                "Access-Control-Allow-Origin": "http://localhost:3000",
+                "Access-Control-Allow-Origin": settings.BACKEND_CORS_ORIGINS[0] if settings.BACKEND_CORS_ORIGINS else "*",
                 "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
                 "Access-Control-Allow-Headers": "*",
                 "Access-Control-Allow-Credentials": "true"
@@ -2656,3 +2678,572 @@ async def create_plainte_from_temp_file(
         traceback.print_exc()
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
+
+
+# ==================== CRÉATION DEPUIS ARCHIVE ====================
+
+@router.post("/depuis-archive/fichier")
+async def create_plainte_from_archive_file(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(..., description="Fichier PDF ou image de l'archive"),
+    source_archive: str = Form(..., description="Nom du dossier d'archive source"),
+    batch_id: str = Form(..., description="ID du batch de traitement"),
+    processing_order: int = Form(..., description="Ordre de traitement dans le batch"),
+    auto_assign_service: bool = Form(True, description="Assigner automatiquement au service détecté"),
+    db: Session = Depends(get_db)
+):
+    """
+    Crée une plainte à partir d'un fichier d'archive de manière ASYNCHRONE.
+    
+    Workflow (comme pour PDF/Image):
+    1. Upload du fichier et sauvegarde temporaire (rapide)
+    2. Retour immédiat avec task_id
+    3. Traitement en arrière-plan (Celery worker): extraction + analyse IA + création plainte
+    4. Notification WebSocket quand terminé (événement 'archive_file_complete')
+    
+    Args:
+        file: Fichier PDF ou image à traiter
+        source_archive: Nom du dossier d'archive (pour traçabilité)
+        batch_id: ID unique du batch de traitement
+        processing_order: Position dans le batch
+        auto_assign_service: Si True, assigne au service détecté par l'IA
+        
+    Returns:
+        task_id pour suivre le traitement via WebSocket
+    """
+    import uuid
+    
+    try:
+        logger.info(f"📂 [Archive Async] Réception fichier: {file.filename} (batch: {batch_id}, ordre: {processing_order})")
+        
+        # Vérifier le type de fichier
+        filename_lower = file.filename.lower() if file.filename else ""
+        is_pdf = filename_lower.endswith('.pdf')
+        is_image = any(filename_lower.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp'])
+        
+        if not is_pdf and not is_image:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Type de fichier non supporté: {file.filename}. Seuls les PDF et images sont acceptés."
+            )
+        
+        # Lire le contenu du fichier
+        content = await file.read()
+        file_size = len(content)
+        
+        if file_size > 20 * 1024 * 1024:  # 20 MB max pour archives
+            raise HTTPException(status_code=400, detail="Le fichier ne doit pas dépasser 20 MB")
+        
+        # Générer un task_id unique
+        task_id = str(uuid.uuid4())
+        
+        # Sauvegarde temporaire pour traitement par le worker
+        temp_dir = Path("data/temp/archive")
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_filename = f"archive_{task_id}_{file.filename}"
+        temp_path = temp_dir / temp_filename
+        
+        with open(temp_path, "wb") as buffer:
+            buffer.write(content)
+        
+        logger.info(f"📁 [Archive Async] Fichier temp sauvegardé: {temp_path}")
+        
+        # Lancer la tâche Celery pour le traitement complet
+        try:
+            from healthcare_worker_server.app.tasks.celery_tasks import process_archive_file_async
+            celery_task = process_archive_file_async.delay(
+                task_id=task_id,
+                temp_file_path=str(temp_path),
+                filename=file.filename,
+                source_archive=source_archive,
+                batch_id=batch_id,
+                processing_order=processing_order,
+                auto_assign_service=auto_assign_service
+            )
+            logger.info(f"🚀 [Archive Async] Tâche Celery lancée: {celery_task.id}")
+            
+            # Retourner immédiatement avec le task_id
+            return JSONResponse(content={
+                "success": True,
+                "async": True,
+                "task_id": task_id,
+                "celery_task_id": celery_task.id,
+                "filename": file.filename,
+                "file_size": file_size,
+                "batch_id": batch_id,
+                "processing_order": processing_order,
+                "temp_file_path": str(temp_path),
+                "message": "Traitement lancé. Vous serez notifié via WebSocket quand il sera terminé.",
+                "websocket_events": {
+                    "started": "archive_file_started",
+                    "progress": "archive_file_progress",
+                    "complete": "archive_file_complete",
+                    "failed": "archive_file_failed"
+                }
+            })
+            
+        except Exception as celery_error:
+            logger.warning(f"⚠️ [Archive] Celery non disponible: {celery_error}. Traitement synchrone de secours.")
+            
+            # Fallback synchrone si Celery n'est pas disponible
+            return await _process_archive_file_sync(
+                file=file,
+                temp_path=temp_path,
+                content=content,
+                file_size=file_size,
+                source_archive=source_archive,
+                batch_id=batch_id,
+                processing_order=processing_order,
+                auto_assign_service=auto_assign_service,
+                task_id=task_id,
+                db=db,
+                background_tasks=background_tasks
+            )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erreur création plainte depuis archive: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
+
+
+async def _process_archive_file_sync(
+    file: UploadFile,
+    temp_path: Path,
+    content: bytes,
+    file_size: int,
+    source_archive: str,
+    batch_id: str,
+    processing_order: int,
+    auto_assign_service: bool,
+    task_id: str,
+    db: Session,
+    background_tasks: BackgroundTasks = None
+):
+    """
+    Traitement synchrone de secours si Celery n'est pas disponible.
+    """
+    import shutil
+    
+    try:
+        filename_lower = file.filename.lower() if file.filename else ""
+        is_pdf = filename_lower.endswith('.pdf')
+        is_image = any(filename_lower.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp'])
+        
+        # Extraction du texte
+        extracted_text = ""
+        extraction_confidence = 0.0
+        
+        if is_pdf and PDF_EXTRACTION_AVAILABLE:
+            try:
+                document_parser = DocumentParserService()
+                extraction_result = document_parser.extract_text_from_document(str(temp_path))
+                if extraction_result.get("success"):
+                    extracted_text = extraction_result.get("text", "")
+            except Exception as e:
+                logger.warning(f"⚠️ Erreur extraction PDF: {e}")
+        
+        elif is_image and IMAGE_OCR_AVAILABLE:
+            try:
+                ocr_service = get_ocr_service()
+                ocr_result = ocr_service.extract_text_from_file(str(temp_path))
+                if ocr_result.get("success"):
+                    extracted_text = ocr_result.get("text", "")
+                    extraction_confidence = ocr_result.get("confidence", 0.0)
+            except Exception as e:
+                logger.warning(f"⚠️ Erreur OCR: {e}")
+        
+        # Fallback PyPDF2
+        if not extracted_text and is_pdf:
+            try:
+                import PyPDF2
+                with open(temp_path, 'rb') as f:
+                    pdf_reader = PyPDF2.PdfReader(f)
+                    for page in pdf_reader.pages:
+                        page_text = page.extract_text()
+                        if page_text:
+                            extracted_text += page_text + "\n"
+            except Exception as e:
+                logger.warning(f"⚠️ Erreur fallback PDF: {e}")
+        
+        if not extracted_text:
+            raise HTTPException(status_code=400, detail="Impossible d'extraire du texte du fichier.")
+        
+        # Analyse IA (avec timeout court pour mode sync)
+        extracted_data = None
+        if PDF_EXTRACTION_AVAILABLE:
+            try:
+                llm_service = get_llm_service()
+                analysis_service = ComplaintAnalysisService(llm_provider=llm_service)
+                analysis_result = analysis_service.extract_complaint_data_from_pdf(extracted_text)
+                if analysis_result.success:
+                    extracted_data = json.loads(analysis_result.content)
+            except Exception as ai_error:
+                logger.warning(f"⚠️ Erreur analyse IA (sync): {ai_error}")
+        
+        # Construire les données de la plainte
+        titre = f"Plainte importée: {file.filename}"
+        description = extracted_text[:5000]
+        nom_plaignant = "Non spécifié"
+        prenom_plaignant = "Non spécifié"
+        email_plaignant = None
+        telephone_plaignant = None
+        date_incident = None
+        priorite = "MOYEN"
+        service_id = None
+        
+        if extracted_data:
+            plaignant = extracted_data.get("plaignant", {})
+            nom_plaignant = plaignant.get("nom") or nom_plaignant
+            prenom_plaignant = plaignant.get("prenom") or prenom_plaignant
+            email_plaignant = plaignant.get("email")
+            telephone_plaignant = plaignant.get("telephone")
+            
+            plainte_data = extracted_data.get("plainte", {})
+            titre = plainte_data.get("titre") or titre
+            description = plainte_data.get("description") or description
+            date_incident = plainte_data.get("date_incident")
+            
+            analyse = extracted_data.get("analyse", {})
+            priorite = analyse.get("priorite_suggeree") or priorite
+            
+            if auto_assign_service:
+                service_concerne = plainte_data.get("service_concerne")
+                if service_concerne:
+                    service = db.query(Service).filter(
+                        or_(Service.nom.ilike(f"%{service_concerne}%"), Service.code_service.ilike(f"%{service_concerne}%"))
+                    ).first()
+                    if service:
+                        service_id = service.id
+        
+        # Service par défaut
+        if not service_id:
+            default_service = db.query(Service).filter(
+                or_(Service.code_service == "ADM", Service.nom.ilike("%administratif%"))
+            ).first()
+            if default_service:
+                service_id = default_service.id
+            else:
+                first_service = db.query(Service).first()
+                if first_service:
+                    service_id = first_service.id
+                else:
+                    raise HTTPException(status_code=400, detail="Aucun service disponible")
+        
+        service = db.query(Service).filter(Service.id == service_id).first()
+        numero_plainte = generate_numero_plainte(db)
+        
+        while db.query(Plainte).filter(Plainte.numero_plainte == numero_plainte).first():
+            numero_plainte = generate_numero_plainte(db)
+        
+        try:
+            priorite_enum = PrioritePlainte(priorite.upper())
+        except ValueError:
+            priorite_enum = PrioritePlainte.MOYEN
+        
+        new_plainte = Plainte(
+            numero_plainte=numero_plainte,
+            titre=titre,
+            description=description,
+            statut=StatutPlainte.RECU,
+            priorite=priorite_enum,
+            service_id=service_id,
+            date_incident=datetime.strptime(date_incident, "%Y-%m-%d").date() if date_incident and isinstance(date_incident, str) else None,
+            nom_plaignant=nom_plaignant,
+            prenom_plaignant=prenom_plaignant,
+            email_plaignant=email_plaignant,
+            telephone_plaignant=telephone_plaignant,
+            mode_reception="archive_import"
+        )
+        
+        db.add(new_plainte)
+        db.flush()
+        
+        # Déplacer le fichier
+        docs_dir = Path("data/documents/images_originales" if is_image else "data/documents/pdf_originaux")
+        docs_dir.mkdir(parents=True, exist_ok=True)
+        
+        safe_filename = file.filename.replace(" ", "_").replace("/", "_").replace("\\", "_")
+        final_filename = f"{numero_plainte}_{safe_filename}"
+        file_path = docs_dir / final_filename
+        
+        shutil.move(str(temp_path), str(file_path))
+        
+        document = DocumentPlainte(
+            plainte_id=new_plainte.id,
+            nom_fichier=file.filename,
+            nom_stockage=final_filename,
+            chemin_fichier=str(file_path),
+            type_fichier=TypeFichier.PDF if is_pdf else TypeFichier.IMAGE,
+            taille_fichier=file_size,
+            est_piece_jointe_originale=True
+        )
+        
+        db.add(document)
+        db.commit()
+        db.refresh(new_plainte)
+        
+        logger.info(f"✅ [Archive Sync] Plainte {numero_plainte} créée")
+        
+        # 🚀 IMPORTANT: Lancer la génération du PDF automatique en arrière-plan
+        if background_tasks:
+            background_tasks.add_task(launch_background_analysis, new_plainte.id)
+            logger.info(f"📄 [Archive Sync] Génération PDF lancée en arrière-plan pour plainte {new_plainte.id}")
+        else:
+            # Fallback: générer le PDF de manière synchrone si BackgroundTasks non disponible
+            try:
+                pdf_path = generate_pdf_synchrone(new_plainte.id, db)
+                logger.info(f"📄 [Archive Sync] PDF généré: {pdf_path}")
+            except Exception as pdf_error:
+                logger.warning(f"⚠️ [Archive Sync] Erreur génération PDF (non bloquante): {pdf_error}")
+        
+        return JSONResponse(content={
+            "success": True,
+            "async": False,
+            "task_id": task_id,
+            "plainte_id": new_plainte.id,
+            "numero_plainte": numero_plainte,
+            "plainte": {
+                "id": new_plainte.id,
+                "numero_plainte": numero_plainte,
+                "titre": titre[:100] + "..." if len(titre) > 100 else titre,
+                "statut": new_plainte.statut.value if hasattr(new_plainte.statut, 'value') else str(new_plainte.statut),
+                "priorite": new_plainte.priorite.value if hasattr(new_plainte.priorite, 'value') else str(new_plainte.priorite),
+                "service_id": service_id,
+                "service_nom": service.nom if service else "Non défini"
+            },
+            "plaignant": {
+                "nom": nom_plaignant,
+                "prenom": prenom_plaignant
+            },
+            "message": f"Plainte {numero_plainte} créée (mode synchrone)",
+            "pdf_generation": "en_cours"
+        })
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erreur traitement sync: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
+
+
+@router.post("/depuis-archive/scan-dossier")
+async def scan_archive_folder(
+    request: dict,
+    db: Session = Depends(get_db)
+):
+    """
+    Scanne un dossier côté serveur pour lister les fichiers valides.
+    
+    Note: Cette fonctionnalité nécessite que le dossier soit accessible depuis le serveur.
+    Pour des raisons de sécurité, seuls les dossiers dans un répertoire autorisé peuvent être scannés.
+    
+    Args:
+        request: {"folder_path": "chemin/vers/dossier"}
+        
+    Returns:
+        Liste des fichiers PDF et images trouvés
+    """
+    folder_path = request.get("folder_path")
+    
+    if not folder_path:
+        raise HTTPException(status_code=400, detail="folder_path est requis")
+    
+    try:
+        # Répertoire autorisé pour les archives (configurable)
+        base_archives_dir = Path("data/archives")
+        base_archives_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Construire le chemin complet
+        target_dir = base_archives_dir / folder_path
+        
+        # Vérification de sécurité: le chemin doit être dans le répertoire autorisé
+        try:
+            target_dir.resolve().relative_to(base_archives_dir.resolve())
+        except ValueError:
+            raise HTTPException(
+                status_code=403, 
+                detail="Accès refusé: le dossier doit être dans le répertoire d'archives autorisé"
+            )
+        
+        if not target_dir.exists():
+            raise HTTPException(status_code=404, detail=f"Dossier non trouvé: {folder_path}")
+        
+        if not target_dir.is_dir():
+            raise HTTPException(status_code=400, detail="Le chemin spécifié n'est pas un dossier")
+        
+        # Extensions valides
+        valid_extensions = {'.pdf', '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp'}
+        
+        # Scanner le dossier
+        files_list = []
+        for file_path in target_dir.rglob("*"):
+            if file_path.is_file() and file_path.suffix.lower() in valid_extensions:
+                is_pdf = file_path.suffix.lower() == '.pdf'
+                mime_type, _ = mimetypes.guess_type(str(file_path))
+                
+                files_list.append({
+                    "filename": file_path.name,
+                    "filepath": str(file_path.relative_to(base_archives_dir)),
+                    "file_size": file_path.stat().st_size,
+                    "file_type": "pdf" if is_pdf else "image",
+                    "mime_type": mime_type or "application/octet-stream"
+                })
+        
+        return {
+            "success": True,
+            "folder_path": folder_path,
+            "files": files_list,
+            "total_files": len(files_list),
+            "message": f"{len(files_list)} fichiers valides trouvés"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erreur scan dossier archive: {e}")
+        raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
+
+
+@router.post("/depuis-archive/traiter-batch")
+async def process_archive_batch(
+    request: dict,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+    """
+    Lance le traitement batch d'une liste de fichiers d'archive.
+    
+    Cette fonctionnalité traite plusieurs fichiers de manière asynchrone:
+    1. Valide la liste des fichiers
+    2. Génère un batch_id unique
+    3. Lance le traitement en arrière-plan
+    4. Retourne immédiatement pour suivi WebSocket
+    
+    Args:
+        request: {
+            "files": [{"filepath": "...", "filename": "..."}],
+            "options": {"auto_assign_service": true, "batch_size": 5, "continue_on_error": true}
+        }
+        
+    Returns:
+        batch_id et task_id pour suivi
+    """
+    import uuid
+    
+    files = request.get("files", [])
+    options = request.get("options", {})
+    
+    if not files:
+        raise HTTPException(status_code=400, detail="Aucun fichier à traiter")
+    
+    batch_id = str(uuid.uuid4())
+    
+    try:
+        # Valider les fichiers
+        base_archives_dir = Path("data/archives")
+        valid_files = []
+        
+        for f in files:
+            filepath = f.get("filepath")
+            if filepath:
+                full_path = base_archives_dir / filepath
+                if full_path.exists() and full_path.is_file():
+                    valid_files.append({
+                        "filepath": str(full_path),
+                        "filename": f.get("filename", full_path.name)
+                    })
+        
+        if not valid_files:
+            raise HTTPException(status_code=400, detail="Aucun fichier valide trouvé")
+        
+        logger.info(f"📦 Batch {batch_id}: {len(valid_files)} fichiers à traiter")
+        
+        # TODO: Implémenter le traitement batch via Celery
+        # Pour l'instant, retourner les informations pour traitement côté client
+        
+        return {
+            "success": True,
+            "batch_id": batch_id,
+            "task_id": batch_id,  # Utilisé aussi comme task_id pour le suivi
+            "total_files": len(valid_files),
+            "files": valid_files,
+            "options": options,
+            "message": f"Batch {batch_id} prêt pour traitement ({len(valid_files)} fichiers)"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erreur préparation batch: {e}")
+        raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
+
+
+@router.post("/depuis-archive/annuler")
+async def cancel_archive_processing(
+    request: dict,
+    db: Session = Depends(get_db)
+):
+    """
+    Annule les tâches Celery en cours pour l'import d'archive.
+    
+    Args:
+        request: {
+            "task_ids": ["task_id_1", "task_id_2", ...],
+            "batch_id": "optional_batch_id"
+        }
+        
+    Returns:
+        Résumé des annulations
+    """
+    import redis
+    
+    # Connexion Redis pour les flags d'annulation (même db que le worker)
+    redis_client = redis.Redis(host='localhost', port=6379, db=3, decode_responses=True)
+    
+    task_ids = request.get("task_ids", [])
+    batch_id = request.get("batch_id")
+    
+    cancelled = []
+    failed = []
+    
+    try:
+        for task_id in task_ids:
+            try:
+                # Marquer la tâche comme annulée via Redis (le worker vérifie ce flag)
+                redis_client.setex(f"cancelled_task:{task_id}", 3600, "1")
+                cancelled.append(task_id)
+                logger.info(f"🛑 Tâche {task_id} marquée comme annulée dans Redis")
+                
+            except Exception as e:
+                logger.warning(f"⚠️ Impossible d'annuler la tâche {task_id}: {e}")
+                failed.append({"task_id": task_id, "error": str(e)})
+        
+        # Également essayer de révoquer via Celery (pour les tâches en attente)
+        try:
+            from celery_worker_v2 import app as celery_app
+            for task_id in cancelled:
+                celery_app.control.revoke(task_id, terminate=False)
+        except Exception as e:
+            logger.warning(f"⚠️ Revoke Celery échoué (ignoré): {e}")
+        
+        logger.info(f"🛑 Annulation batch: {len(cancelled)} annulées, {len(failed)} échecs")
+        
+        return {
+            "success": True,
+            "cancelled_count": len(cancelled),
+            "cancelled_tasks": cancelled,
+            "failed_count": len(failed),
+            "failed_tasks": failed,
+            "batch_id": batch_id,
+            "message": f"{len(cancelled)} tâche(s) annulée(s)"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Erreur annulation: {e}")
+        raise HTTPException(status_code=500, detail=f"Erreur lors de l'annulation: {str(e)}")
+
+

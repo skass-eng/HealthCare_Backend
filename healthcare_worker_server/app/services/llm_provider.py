@@ -721,7 +721,8 @@ Répondez uniquement avec un JSON valide, sans texte supplémentaire."""
 class OllamaService(BaseLLMService):
     """Service Ollama (local)"""
     
-    def __init__(self, model: str = "qwen2.5:7b", base_url: str = "http://localhost:11434", **kwargs):
+    # 🚀 Modèle par défaut optimisé pour la rapidité (qwen2.5:3b au lieu de 7b)
+    def __init__(self, model: str = "qwen2.5:3b", base_url: str = "http://localhost:11434", **kwargs):
         super().__init__(None, model, **kwargs)
         self.base_url = base_url
         self.sync_client = None
@@ -937,7 +938,8 @@ def create_llm_service(provider: str = None) -> BaseLLMService:
             return AnthropicService(api_key=api_key, model=model)
         
         elif provider == "ollama":
-            model = os.getenv("LLM_MODEL", "qwen2.5:7b")
+            # 🚀 Modèle par défaut: qwen2.5:3b (plus rapide que 7b, bon compromis qualité/vitesse)
+            model = os.getenv("LLM_MODEL", "qwen2.5:3b")
             base_url = os.getenv("LLM_BASE_URL", "http://localhost:11434")
             return OllamaService(model=model, base_url=base_url)
         

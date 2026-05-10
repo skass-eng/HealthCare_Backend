@@ -25,7 +25,25 @@ class Settings(BaseSettings):
     API_PORT: int = 8000
     
     # Configuration CORS
-    BACKEND_CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:3001"]
+    BACKEND_CORS_ORIGINS: List[str] = [
+        "http://localhost:3000", 
+        "http://localhost:3001",
+        "http://172.20.10.3:3000",  # Accès mobile/réseau local
+        "http://127.0.0.1:3000",
+        "http://192.168.1.151:3000",  # Accès réseau local WiFi
+        "http://192.168.1.151:3001",
+        "http://MI-W15XDCK3:3000",  # Accès via nom du PC
+        "http://MI-W15XDCK3:3001",
+        "http://mi-w15xdck3:3000",  # Nom en minuscules (au cas où)
+        "http://mi-w15xdck3:3001",
+        "https://healthcare.pulse-360.fr",  # Production - Frontend
+        "https://api-healthcare.pulse-360.fr",  # Production - API
+        "https://pulse-360.fr",  # Domaine principal
+        "https://www.pulse-360.fr",  # WWW
+    ]
+    
+    # Autoriser tous les domaines ngrok (pour le développement/démo)
+    CORS_ALLOW_ALL_ORIGINS: bool = True  # Active pour supporter ngrok
     
     # Configuration base de données PostgreSQL (obligatoire comme ODYSSEE)
     DATABASE_URL: PostgresDsn = "postgresql://postgres:242261@localhost:5430/hospital_complaints"

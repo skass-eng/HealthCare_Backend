@@ -222,9 +222,25 @@ def get_socketio_server():
     return sio
 
 # Configuration CORS (comme ODYSSEE) - Doit être AVANT les autres middlewares
+# Note: allow_credentials=True n'est PAS compatible avec allow_origins=["*"]
+# On doit spécifier explicitement les origines autorisées
+# Pour ngrok, on ajoute dynamiquement les patterns ngrok
+cors_origins = list(settings.BACKEND_CORS_ORIGINS)
+
+# Ajouter le support pour ngrok (développement/démo)
+if getattr(settings, 'CORS_ALLOW_ALL_ORIGINS', False):
+    # En mode développement avec ngrok, on accepte toutes les origines ngrok
+    cors_origins.extend([
+        "https://*.ngrok.io",
+        "https://*.ngrok-free.app",
+        "http://*.ngrok.io",
+        "http://*.ngrok-free.app",
+    ])
+
 fastapi_app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Temporairement autoriser toutes les origines
+    allow_origins=cors_origins,  # Utilise la config centralisée + ngrok
+    allow_origin_regex=r"https://.*\.pulse-360\.fr|https://pulse-360\.fr|https://.*\.ngrok(-free)?\.(app|dev)|https://.*\.ngrok\.io|https://.*\.loca\.lt|https://.*\.trycloudflare\.com",  # Regex pour production et tunnels
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -237,12 +253,16 @@ async def log_requests(request, call_next):
     start_time = datetime.now()
     
     # Gérer les requêtes OPTIONS pour CORS preflight
+    origin = request.headers.get("origin", "")
+    allowed_origin = origin if origin in settings.BACKEND_CORS_ORIGINS else ""
+    
     if request.method == "OPTIONS":
         response = JSONResponse(content={}, status_code=200)
-        response.headers["Access-Control-Allow-Origin"] = request.headers.get("origin", "*")
-        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "*"
-        response.headers["Access-Control-Allow-Credentials"] = "true"
+        if allowed_origin:
+            response.headers["Access-Control-Allow-Origin"] = allowed_origin
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "*"
+            response.headers["Access-Control-Allow-Credentials"] = "true"
         return response
     
     try:
@@ -254,8 +274,9 @@ async def log_requests(request, call_next):
             status_code=500,
             content={"detail": str(e)}
         )
-        response.headers["Access-Control-Allow-Origin"] = request.headers.get("origin", "*")
-        response.headers["Access-Control-Allow-Credentials"] = "true"
+        if allowed_origin:
+            response.headers["Access-Control-Allow-Origin"] = allowed_origin
+            response.headers["Access-Control-Allow-Credentials"] = "true"
     
     process_time = (datetime.now() - start_time).total_seconds()
     

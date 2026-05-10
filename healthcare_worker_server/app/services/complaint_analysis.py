@@ -2,9 +2,11 @@
 Service d'analyse IA pour les plaintes avec prompts spécialisés
 """
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -516,27 +518,144 @@ Format JSON STRICT:
             )
     
     def perform_complete_analysis(self, complaint_text: str) -> Dict[str, AnalysisResult]:
-        """Effectue l'analyse complète de la plainte (sentiment, résumé, contacts)"""
-        logger.info("Démarrage de l'analyse complète de la plainte")
+        """
+        Effectue l'analyse complète de la plainte (sentiment, résumé, contacts).
+        
+        🚀 OPTIMISÉ: Les 3 analyses sont exécutées EN PARALLÈLE.
+        """
+        start_time = time.time()
+        logger.info("⚡ Démarrage de l'analyse complète de la plainte EN PARALLÈLE")
         
         results = {}
         
-        # 1. Analyse de sentiment
-        results["sentiment"] = self.analyze_sentiment(complaint_text)
+        # 🚀 EXÉCUTION PARALLÈLE DES 3 ANALYSES
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
+                executor.submit(self.analyze_sentiment, complaint_text): "sentiment",
+                executor.submit(self.generate_summary, complaint_text): "summary",
+                executor.submit(self.extract_contacts, complaint_text): "contacts",
+            }
+            
+            for future in as_completed(futures):
+                analysis_name = futures[future]
+                try:
+                    result = future.result(timeout=120)
+                    results[analysis_name] = result
+                    logger.info(f"✅ [PARALLEL] {analysis_name} terminé")
+                except Exception as e:
+                    logger.error(f"❌ [PARALLEL] Erreur {analysis_name}: {e}")
+                    results[analysis_name] = AnalysisResult(
+                        success=False,
+                        content="",
+                        confidence=0.0,
+                        metadata={},
+                        error=str(e)
+                    )
         
-        # 2. Génération de résumé
-        results["summary"] = self.generate_summary(complaint_text)
-        
-        # 3. Extraction de contacts
-        results["contacts"] = self.extract_contacts(complaint_text)
-        
-        logger.info("Analyse complète terminée")
+        elapsed_time = time.time() - start_time
+        logger.info(f"✅ Analyse complète PARALLÈLE terminée en {elapsed_time:.2f}s")
         return results
+
+    # ===== MÉTHODES HELPER POUR EXTRACTION PARALLÈLE =====
+    
+    def _extract_plaignant_parallel(self, complaint_text: str) -> Tuple[str, Dict[str, Any], float, Optional[str]]:
+        """
+        Extrait les informations du plaignant (exécuté en parallèle).
+        
+        Returns:
+            Tuple (nom_extraction, data_dict, confiance, erreur)
+        """
+        try:
+            logger.info("📧 [PARALLEL] Extraction des informations du plaignant...")
+            prompt = self.prompts["extract_plaignant"].format(complaint_text=complaint_text)
+            response = self.llm_provider.generate_response(prompt)
+            
+            data = json.loads(response)
+            confiance = data.get("confiance", 0.5)
+            logger.info(f"✅ [PARALLEL] Plaignant extrait (confiance: {confiance})")
+            return ("plaignant", data, confiance, None)
+        except json.JSONDecodeError as e:
+            logger.warning(f"⚠️ [PARALLEL] Erreur parsing JSON plaignant: {e}")
+            return ("plaignant", {}, 0.0, f"Erreur JSON: {e}")
+        except Exception as e:
+            logger.error(f"❌ [PARALLEL] Erreur extraction plaignant: {e}")
+            return ("plaignant", {}, 0.0, str(e))
+    
+    def _extract_service_parallel(self, complaint_text: str) -> Tuple[str, Dict[str, Any], float, Optional[str]]:
+        """
+        Extrait les informations du service (exécuté en parallèle).
+        
+        Returns:
+            Tuple (nom_extraction, data_dict, confiance, erreur)
+        """
+        try:
+            logger.info("🏥 [PARALLEL] Extraction des informations du service...")
+            prompt = self.prompts["extract_service"].format(complaint_text=complaint_text)
+            response = self.llm_provider.generate_response(prompt)
+            
+            data = json.loads(response)
+            confiance = data.get("confiance", 0.5)
+            logger.info(f"✅ [PARALLEL] Service extrait: {data.get('service_principal')} (confiance: {confiance})")
+            return ("service", data, confiance, None)
+        except json.JSONDecodeError as e:
+            logger.warning(f"⚠️ [PARALLEL] Erreur parsing JSON service: {e}")
+            return ("service", {}, 0.0, f"Erreur JSON: {e}")
+        except Exception as e:
+            logger.error(f"❌ [PARALLEL] Erreur extraction service: {e}")
+            return ("service", {}, 0.0, str(e))
+    
+    def _extract_description_parallel(self, complaint_text: str) -> Tuple[str, Dict[str, Any], float, Optional[str]]:
+        """
+        Extrait la description de la plainte (exécuté en parallèle).
+        
+        Returns:
+            Tuple (nom_extraction, data_dict, confiance, erreur)
+        """
+        try:
+            logger.info("📝 [PARALLEL] Extraction de la description...")
+            prompt = self.prompts["extract_description"].format(complaint_text=complaint_text)
+            response = self.llm_provider.generate_response(prompt)
+            
+            data = json.loads(response)
+            confiance = data.get("confiance", 0.5)
+            titre = data.get("titre", "")[:50] if data.get("titre") else "N/A"
+            logger.info(f"✅ [PARALLEL] Description extraite: {titre}... (confiance: {confiance})")
+            return ("description", data, confiance, None)
+        except json.JSONDecodeError as e:
+            logger.warning(f"⚠️ [PARALLEL] Erreur parsing JSON description: {e}")
+            return ("description", {}, 0.0, f"Erreur JSON: {e}")
+        except Exception as e:
+            logger.error(f"❌ [PARALLEL] Erreur extraction description: {e}")
+            return ("description", {}, 0.0, str(e))
+    
+    def _extract_analyse_parallel(self, complaint_text: str) -> Tuple[str, Dict[str, Any], float, Optional[str]]:
+        """
+        Extrait l'analyse de priorité (exécuté en parallèle).
+        
+        Returns:
+            Tuple (nom_extraction, data_dict, confiance, erreur)
+        """
+        try:
+            logger.info("🎯 [PARALLEL] Extraction de l'analyse de priorité...")
+            prompt = self.prompts["extract_analyse"].format(complaint_text=complaint_text)
+            response = self.llm_provider.generate_response(prompt)
+            
+            data = json.loads(response)
+            confiance = data.get("confiance", 0.5)
+            logger.info(f"✅ [PARALLEL] Analyse extraite: priorité={data.get('priorite_suggeree', 'N/A')} (confiance: {confiance})")
+            return ("analyse", data, confiance, None)
+        except json.JSONDecodeError as e:
+            logger.warning(f"⚠️ [PARALLEL] Erreur parsing JSON analyse: {e}")
+            return ("analyse", {}, 0.0, f"Erreur JSON: {e}")
+        except Exception as e:
+            logger.error(f"❌ [PARALLEL] Erreur extraction analyse: {e}")
+            return ("analyse", {}, 0.0, str(e))
 
     def extract_complaint_data_from_pdf_multi_prompt(self, complaint_text: str) -> AnalysisResult:
         """
         Extrait les données structurées d'une plainte en utilisant plusieurs prompts spécialisés.
-        Cette méthode augmente la confiance en faisant une requête IA par type d'information.
+        
+        🚀 OPTIMISÉ: Les 4 prompts sont exécutés EN PARALLÈLE pour réduire le temps de ~70%.
         
         Args:
             complaint_text: Texte extrait du PDF de plainte
@@ -544,13 +663,14 @@ Format JSON STRICT:
         Returns:
             AnalysisResult contenant les données extraites avec haute confiance
         """
-        logger.info("🔬 Démarrage de l'extraction MULTI-PROMPT depuis le PDF de plainte")
+        start_time = time.time()
+        logger.info("🔬 Démarrage de l'extraction MULTI-PROMPT PARALLÈLE depuis le PDF de plainte")
         
         if not self.llm_provider:
             logger.warning("LLM non disponible, utilisation du fallback")
             return self._extract_complaint_data_fallback(complaint_text)
         
-        # Résultats par catégorie
+        # Résultats par catégorie (valeurs par défaut)
         results = {
             "plaignant": {"nom": None, "prenom": None, "email": None, "telephone": None},
             "plainte": {"titre": None, "description": None, "date_incident": None, "service_concerne": None, "mode_reception": "pdf_import"},
@@ -560,111 +680,68 @@ Format JSON STRICT:
         
         confiances = []
         
-        # 1. Extraction du plaignant
-        try:
-            logger.info("📧 Extraction des informations du plaignant...")
-            prompt_plaignant = self.prompts["extract_plaignant"].format(complaint_text=complaint_text)
-            response_plaignant = self.llm_provider.generate_response(prompt_plaignant)
-            
-            try:
-                data_plaignant = json.loads(response_plaignant)
-                results["plaignant"]["nom"] = data_plaignant.get("nom")
-                results["plaignant"]["prenom"] = data_plaignant.get("prenom")
-                results["plaignant"]["email"] = data_plaignant.get("email")
-                results["plaignant"]["telephone"] = data_plaignant.get("telephone")
-                
-                conf_plaignant = data_plaignant.get("confiance", 0.5)
-                confiances.append(conf_plaignant)
-                results["confiance_extraction"]["scores_par_categorie"]["plaignant"] = conf_plaignant
-                logger.info(f"✅ Plaignant extrait: {results['plaignant']} (confiance: {conf_plaignant})")
-            except json.JSONDecodeError as e:
-                logger.warning(f"⚠️ Erreur parsing JSON plaignant: {e}")
-                results["confiance_extraction"]["champs_incertains"].append("plaignant")
-        except Exception as e:
-            logger.error(f"❌ Erreur extraction plaignant: {e}")
-            results["confiance_extraction"]["champs_incertains"].append("plaignant")
+        # 🚀 EXÉCUTION PARALLÈLE DES 4 PROMPTS
+        logger.info("⚡ Lancement des 4 extractions en PARALLÈLE...")
         
-        # 2. Extraction du service
-        try:
-            logger.info("🏥 Extraction des informations du service...")
-            prompt_service = self.prompts["extract_service"].format(complaint_text=complaint_text)
-            response_service = self.llm_provider.generate_response(prompt_service)
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            # Soumettre les 4 tâches en parallèle
+            futures = {
+                executor.submit(self._extract_plaignant_parallel, complaint_text): "plaignant",
+                executor.submit(self._extract_service_parallel, complaint_text): "service",
+                executor.submit(self._extract_description_parallel, complaint_text): "description",
+                executor.submit(self._extract_analyse_parallel, complaint_text): "analyse",
+            }
             
-            try:
-                data_service = json.loads(response_service)
-                results["plainte"]["service_concerne"] = data_service.get("service_principal")
-                
-                # Stocker les infos supplémentaires dans les métadonnées
-                results["service_details"] = {
-                    "services_secondaires": data_service.get("services_secondaires", []),
-                    "personnel_mentionne": data_service.get("personnel_mentionne", []),
-                    "lieu_precis": data_service.get("lieu_precis")
-                }
-                
-                conf_service = data_service.get("confiance", 0.5)
-                confiances.append(conf_service)
-                results["confiance_extraction"]["scores_par_categorie"]["service"] = conf_service
-                logger.info(f"✅ Service extrait: {results['plainte']['service_concerne']} (confiance: {conf_service})")
-            except json.JSONDecodeError as e:
-                logger.warning(f"⚠️ Erreur parsing JSON service: {e}")
-                results["confiance_extraction"]["champs_incertains"].append("service")
-        except Exception as e:
-            logger.error(f"❌ Erreur extraction service: {e}")
-            results["confiance_extraction"]["champs_incertains"].append("service")
-        
-        # 3. Extraction de la description
-        try:
-            logger.info("📝 Extraction de la description...")
-            prompt_description = self.prompts["extract_description"].format(complaint_text=complaint_text)
-            response_description = self.llm_provider.generate_response(prompt_description)
-            
-            try:
-                data_description = json.loads(response_description)
-                results["plainte"]["titre"] = data_description.get("titre")
-                results["plainte"]["description"] = data_description.get("description")
-                results["plainte"]["date_incident"] = data_description.get("date_incident")
-                results["plainte"]["mode_reception"] = data_description.get("mode_reception", "pdf_import")
-                
-                # Stocker les demandes du plaignant
-                results["demandes_plaignant"] = data_description.get("demandes_plaignant", [])
-                
-                conf_description = data_description.get("confiance", 0.5)
-                confiances.append(conf_description)
-                results["confiance_extraction"]["scores_par_categorie"]["description"] = conf_description
-                logger.info(f"✅ Description extraite: {results['plainte']['titre'][:50]}... (confiance: {conf_description})")
-            except json.JSONDecodeError as e:
-                logger.warning(f"⚠️ Erreur parsing JSON description: {e}")
-                results["confiance_extraction"]["champs_incertains"].append("description")
-        except Exception as e:
-            logger.error(f"❌ Erreur extraction description: {e}")
-            results["confiance_extraction"]["champs_incertains"].append("description")
-        
-        # 4. Extraction de l'analyse
-        try:
-            logger.info("🎯 Extraction de l'analyse de priorité...")
-            prompt_analyse = self.prompts["extract_analyse"].format(complaint_text=complaint_text)
-            response_analyse = self.llm_provider.generate_response(prompt_analyse)
-            
-            try:
-                data_analyse = json.loads(response_analyse)
-                results["analyse"]["priorite_suggeree"] = data_analyse.get("priorite_suggeree", "MOYEN")
-                results["analyse"]["gravite_estimee"] = data_analyse.get("gravite_estimee", "modérée")
-                results["analyse"]["mots_cles"] = data_analyse.get("mots_cles", [])
-                results["analyse"]["resume_court"] = data_analyse.get("resume_court", "")
-                
-                # Stocker les risques identifiés
-                results["risques_identifies"] = data_analyse.get("risques_identifies", [])
-                
-                conf_analyse = data_analyse.get("confiance", 0.5)
-                confiances.append(conf_analyse)
-                results["confiance_extraction"]["scores_par_categorie"]["analyse"] = conf_analyse
-                logger.info(f"✅ Analyse extraite: priorité={results['analyse']['priorite_suggeree']} (confiance: {conf_analyse})")
-            except json.JSONDecodeError as e:
-                logger.warning(f"⚠️ Erreur parsing JSON analyse: {e}")
-                results["confiance_extraction"]["champs_incertains"].append("analyse")
-        except Exception as e:
-            logger.error(f"❌ Erreur extraction analyse: {e}")
-            results["confiance_extraction"]["champs_incertains"].append("analyse")
+            # Récupérer les résultats au fur et à mesure qu'ils arrivent
+            for future in as_completed(futures):
+                extraction_name = futures[future]
+                try:
+                    name, data, confiance, error = future.result(timeout=120)  # Timeout 2 min par extraction
+                    
+                    if error:
+                        results["confiance_extraction"]["champs_incertains"].append(name)
+                        continue
+                    
+                    # Intégrer les données selon le type d'extraction
+                    if name == "plaignant":
+                        results["plaignant"]["nom"] = data.get("nom")
+                        results["plaignant"]["prenom"] = data.get("prenom")
+                        results["plaignant"]["email"] = data.get("email")
+                        results["plaignant"]["telephone"] = data.get("telephone")
+                        confiances.append(confiance)
+                        results["confiance_extraction"]["scores_par_categorie"]["plaignant"] = confiance
+                    
+                    elif name == "service":
+                        results["plainte"]["service_concerne"] = data.get("service_principal")
+                        results["service_details"] = {
+                            "services_secondaires": data.get("services_secondaires", []),
+                            "personnel_mentionne": data.get("personnel_mentionne", []),
+                            "lieu_precis": data.get("lieu_precis")
+                        }
+                        confiances.append(confiance)
+                        results["confiance_extraction"]["scores_par_categorie"]["service"] = confiance
+                    
+                    elif name == "description":
+                        results["plainte"]["titre"] = data.get("titre")
+                        results["plainte"]["description"] = data.get("description")
+                        results["plainte"]["date_incident"] = data.get("date_incident")
+                        results["plainte"]["mode_reception"] = data.get("mode_reception", "pdf_import")
+                        results["demandes_plaignant"] = data.get("demandes_plaignant", [])
+                        confiances.append(confiance)
+                        results["confiance_extraction"]["scores_par_categorie"]["description"] = confiance
+                    
+                    elif name == "analyse":
+                        results["analyse"]["priorite_suggeree"] = data.get("priorite_suggeree", "MOYEN")
+                        results["analyse"]["gravite_estimee"] = data.get("gravite_estimee", "modérée")
+                        results["analyse"]["mots_cles"] = data.get("mots_cles", [])
+                        results["analyse"]["resume_court"] = data.get("resume_court", "")
+                        results["risques_identifies"] = data.get("risques_identifies", [])
+                        confiances.append(confiance)
+                        results["confiance_extraction"]["scores_par_categorie"]["analyse"] = confiance
+                        
+                except Exception as e:
+                    logger.error(f"❌ Erreur récupération résultat {extraction_name}: {e}")
+                    results["confiance_extraction"]["champs_incertains"].append(extraction_name)
         
         # Calcul du score de confiance global (moyenne des confiances)
         if confiances:
@@ -672,7 +749,8 @@ Format JSON STRICT:
         else:
             results["confiance_extraction"]["score_global"] = 0.3
         
-        logger.info(f"🏁 Extraction MULTI-PROMPT terminée. Score global: {results['confiance_extraction']['score_global']}")
+        elapsed_time = time.time() - start_time
+        logger.info(f"🏁 Extraction MULTI-PROMPT PARALLÈLE terminée en {elapsed_time:.2f}s. Score global: {results['confiance_extraction']['score_global']}")
         
         return AnalysisResult(
             success=True,
@@ -681,8 +759,10 @@ Format JSON STRICT:
             metadata={
                 "analysis_type": "extract_complaint_data_multi_prompt",
                 "model_used": self.llm_provider.model_name,
-                "source": "llm_multi_prompt",
+                "source": "llm_multi_prompt_parallel",
                 "prompts_used": 4,
+                "execution_mode": "parallel",
+                "execution_time_seconds": round(elapsed_time, 2),
                 "scores_par_categorie": results["confiance_extraction"]["scores_par_categorie"]
             }
         )

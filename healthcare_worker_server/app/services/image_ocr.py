@@ -127,29 +127,33 @@ class ImageOCRService:
         
         return self.extract_text_from_image(image_bytes, path.name)
     
-    def _preprocess_image(self, image: Image.Image) -> Tuple[Image.Image, Dict[str, Any]]:
+    def _preprocess_image(self, image: Image.Image, fast_mode: bool = True) -> Tuple[Image.Image, Dict[str, Any]]:
         """
         Prétraite l'image pour améliorer la qualité OCR
         
+        🚀 OPTIMISÉ: Mode rapide par défaut (moins d'étapes de traitement)
+        
         Args:
             image: Image PIL à traiter
+            fast_mode: Si True, applique seulement les traitements essentiels (plus rapide)
             
         Returns:
             Tuple (image traitée, informations de prétraitement)
         """
         preprocessing_info = {
             "steps_applied": [],
-            "original_size": image.size
+            "original_size": image.size,
+            "fast_mode": fast_mode
         }
         
         try:
-            # 1. Conversion en RGB si nécessaire
+            # 1. Conversion en RGB si nécessaire (toujours appliqué)
             if image.mode not in ('RGB', 'L'):
                 image = image.convert('RGB')
                 preprocessing_info["steps_applied"].append("convert_to_rgb")
             
-            # 2. Redimensionnement si l'image est trop petite
-            min_dimension = 1000
+            # 2. Redimensionnement si l'image est trop petite (toujours appliqué)
+            min_dimension = 800  # 🚀 Réduit de 1000 à 800 pour plus de rapidité
             width, height = image.size
             if width < min_dimension or height < min_dimension:
                 scale_factor = max(min_dimension / width, min_dimension / height)
@@ -157,25 +161,26 @@ class ImageOCRService:
                 image = image.resize(new_size, Image.Resampling.LANCZOS)
                 preprocessing_info["steps_applied"].append(f"resize_to_{new_size}")
             
-            # 3. Conversion en niveaux de gris pour l'OCR
+            # 3. Conversion en niveaux de gris (toujours appliqué)
             if image.mode != 'L':
                 image = image.convert('L')
                 preprocessing_info["steps_applied"].append("convert_to_grayscale")
             
-            # 4. Amélioration du contraste
-            enhancer = ImageEnhance.Contrast(image)
-            image = enhancer.enhance(1.5)
-            preprocessing_info["steps_applied"].append("enhance_contrast")
-            
-            # 5. Netteté
-            enhancer = ImageEnhance.Sharpness(image)
-            image = enhancer.enhance(1.2)
-            preprocessing_info["steps_applied"].append("enhance_sharpness")
-            
-            # 6. Binarisation (seuillage) pour les documents
-            # Utilisation d'un filtre de netteté léger
-            image = image.filter(ImageFilter.SHARPEN)
-            preprocessing_info["steps_applied"].append("sharpen_filter")
+            # 🚀 Les étapes suivantes sont optionnelles en mode rapide
+            if not fast_mode:
+                # 4. Amélioration du contraste (mode complet seulement)
+                enhancer = ImageEnhance.Contrast(image)
+                image = enhancer.enhance(1.5)
+                preprocessing_info["steps_applied"].append("enhance_contrast")
+                
+                # 5. Netteté (mode complet seulement)
+                enhancer = ImageEnhance.Sharpness(image)
+                image = enhancer.enhance(1.2)
+                preprocessing_info["steps_applied"].append("enhance_sharpness")
+                
+                # 6. Filtre de netteté (mode complet seulement)
+                image = image.filter(ImageFilter.SHARPEN)
+                preprocessing_info["steps_applied"].append("sharpen_filter")
             
             preprocessing_info["final_size"] = image.size
             preprocessing_info["success"] = True
@@ -191,6 +196,9 @@ class ImageOCRService:
         """
         Effectue l'OCR et calcule un score de confiance
         
+        🚀 OPTIMISÉ: UN SEUL appel Tesseract (image_to_data) au lieu de deux.
+        Le texte est reconstruit à partir des données détaillées.
+        
         Args:
             image: Image PIL prétraitée
             
@@ -198,15 +206,30 @@ class ImageOCRService:
             Dict avec texte et score de confiance
         """
         try:
-            # Extraction du texte simple
-            text = pytesseract.image_to_string(image, config=self.tesseract_config)
-            
-            # Extraction des données détaillées pour le calcul de confiance
+            # 🚀 UN SEUL appel Tesseract qui retourne tout (texte + confiance)
             data = pytesseract.image_to_data(image, config=self.tesseract_config, output_type=pytesseract.Output.DICT)
             
-            # Calcul du score de confiance moyen
-            confidences = [int(conf) for conf in data['conf'] if conf != '-1' and int(conf) > 0]
+            # Reconstruire le texte à partir des données (évite le 2ème appel)
+            words = []
+            confidences = []
+            current_line = -1
             
+            for i, word in enumerate(data['text']):
+                if word.strip():
+                    # Ajouter un saut de ligne si on change de ligne
+                    if data['line_num'][i] != current_line and current_line != -1:
+                        words.append('\n')
+                    current_line = data['line_num'][i]
+                    words.append(word)
+                    
+                    # Collecter les confiances valides
+                    conf = data['conf'][i]
+                    if conf != '-1' and int(conf) > 0:
+                        confidences.append(int(conf))
+            
+            text = ' '.join(words)
+            
+            # Calcul du score de confiance moyen
             if confidences:
                 avg_confidence = sum(confidences) / len(confidences) / 100.0
             else:
@@ -215,7 +238,7 @@ class ImageOCRService:
             return {
                 "text": text,
                 "confidence": avg_confidence,
-                "word_count": len([w for w in data['text'] if w.strip()]),
+                "word_count": len([w for w in words if w.strip() and w != '\n']),
                 "details": {
                     "total_words_detected": len(confidences),
                     "min_confidence": min(confidences) / 100.0 if confidences else 0,
@@ -224,23 +247,13 @@ class ImageOCRService:
             }
             
         except Exception as e:
-            logger.error(f"❌ Erreur OCR détaillé: {e}")
-            # Fallback sur extraction simple
-            try:
-                text = pytesseract.image_to_string(image, config=self.tesseract_config)
-                return {
-                    "text": text,
-                    "confidence": 0.5,  # Confiance par défaut
-                    "word_count": len(text.split()),
-                    "details": {}
-                }
-            except Exception as e2:
-                return {
-                    "text": "",
-                    "confidence": 0.0,
-                    "word_count": 0,
-                    "details": {"error": str(e2)}
-                }
+            logger.error(f"❌ Erreur OCR: {e}")
+            return {
+                "text": "",
+                "confidence": 0.0,
+                "word_count": 0,
+                "details": {"error": str(e)}
+            }
     
     def _assess_ocr_quality(self, text: str, confidence: float) -> Dict[str, Any]:
         """

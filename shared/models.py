@@ -274,7 +274,7 @@ class Plainte(Base):
     date_incident = Column(Date)
     date_limite_reponse = Column(Date)
     date_resolution = Column(DateTime)
-    date_creation = Column(DateTime, nullable=False, server_default=func.now())
+    date_creation = Column(DateTime, nullable=False, default=datetime.utcnow, server_default=func.now())
     date_modification = Column(DateTime, onupdate=func.now())
     date_suppression = Column(DateTime)
     
