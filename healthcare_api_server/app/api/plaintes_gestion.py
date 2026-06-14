@@ -883,6 +883,66 @@ def get_analyses_plainte(
 
 # ==================== STATISTIQUES ====================
 
+@router.get("/statistiques/performance", response_model=dict)
+async def statistiques_performance(db: Session = Depends(get_db)):
+    """KPI de performance CALCULÉS depuis la base (remplace les valeurs codées en dur).
+
+    Tout vient de données réelles ; les champs valent None/0 quand la donnée manque
+    plutôt qu'une valeur factice.
+    """
+    total = db.query(Plainte).count()
+    clos = [StatutPlainte.TRAITE, StatutPlainte.CLOTURE]
+    resolues = db.query(Plainte).filter(Plainte.statut.in_(clos)).count()
+    taux_resolution = round(resolues / total * 100, 1) if total else 0.0
+
+    # Temps moyen de traitement (jours) sur les plaintes effectivement résolues
+    avg_secs = db.query(
+        func.avg(func.extract("epoch", Plainte.date_resolution - Plainte.date_creation))
+    ).filter(Plainte.date_resolution.isnot(None)).scalar()
+    temps_traitement_moyen_jours = round(float(avg_secs) / 86400.0, 1) if avg_secs else None
+
+    # Plaintes en retard (délai dépassé, non clôturées)
+    today = datetime.now().date()
+    nb_en_retard = db.query(Plainte).filter(
+        Plainte.date_limite_reponse.isnot(None),
+        Plainte.date_limite_reponse < today,
+        Plainte.statut.notin_(clos),
+    ).count()
+    taux_en_retard = round(nb_en_retard / total * 100, 1) if total else 0.0
+
+    # Satisfaction robuste : moyenne du sentiment depuis analyses_ia (toujours alimenté
+    # quand l'IA a tourné), converti [-1,1] -> [0,100].
+    avg_sent = db.query(func.avg(AnalyseIA.score_sentiment)).filter(
+        AnalyseIA.score_sentiment.isnot(None)
+    ).scalar()
+    satisfaction_pct = round(((float(avg_sent) + 1) / 2) * 100, 1) if avg_sent is not None else None
+
+    # Taux de récurrence : part des plaintes dans une catégorie qui revient (>1 fois)
+    cat_rows = db.query(Plainte.categorie_principale, func.count()).filter(
+        Plainte.categorie_principale.isnot(None)
+    ).group_by(Plainte.categorie_principale).all()
+    total_cat = sum(c for _, c in cat_rows)
+    recurrents = sum(c for _, c in cat_rows if c > 1)
+    taux_recurrence = round(recurrents / total_cat * 100, 1) if total_cat else 0.0
+
+    # Réponses officielles & accusés envoyés (suivi qualité)
+    nb_reponses_envoyees = db.query(Plainte).filter(Plainte.reponse_envoyee.is_(True)).count()
+    nb_accuses = db.query(Plainte).filter(Plainte.accuse_reception_envoye.is_(True)).count()
+
+    return {
+        "total": total,
+        "resolues": resolues,
+        "taux_resolution": taux_resolution,
+        "temps_traitement_moyen_jours": temps_traitement_moyen_jours,
+        "nb_en_retard": nb_en_retard,
+        "taux_en_retard": taux_en_retard,
+        "satisfaction_pct": satisfaction_pct,
+        "taux_recurrence": taux_recurrence,
+        "nb_reponses_envoyees": nb_reponses_envoyees,
+        "nb_accuses_reception": nb_accuses,
+    }
+
+
 @router.get("/statistiques/global", response_model=dict)
 def get_statistiques_globales(
     date_debut: Optional[datetime] = Query(None, description="Date de début (format: YYYY-MM-DD)"),
