@@ -660,6 +660,7 @@ async def create_new_complaint(
             assignee_a_id=user_id,
             priorite=PrioritePlainte(priorite),
             statut=StatutPlainte.EN_COURS,
+            mode_reception="formulaire",
             date_creation=datetime.now(),
             date_modification=datetime.now()
         )

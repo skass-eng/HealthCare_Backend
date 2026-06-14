@@ -26,6 +26,7 @@ class RegisterRequest(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=6, description="Mot de passe (min 6 caractères)")
     name: str = Field(..., min_length=2, description="Nom complet")
+    type_utilisateur: str | None = Field(None, description="Rôle optionnel (ex: RESPONSABLE_QUALITE)")
 
 class RegisterResponse(BaseModel):
     """Réponse après inscription réussie"""
@@ -69,7 +70,18 @@ async def register(
     name_parts = request.name.strip().split(' ', 1)
     prenom = name_parts[0]
     nom = name_parts[1] if len(name_parts) > 1 else name_parts[0]
-    
+
+    # Rôle : celui fourni s'il est valide, sinon UTILISATEUR par défaut
+    role = UserRole.UTILISATEUR
+    if request.type_utilisateur:
+        try:
+            role = UserRole(request.type_utilisateur)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Type d'utilisateur invalide: {request.type_utilisateur}"
+            )
+
     # Créer le nouvel utilisateur
     new_user = User(
         email=request.email,
@@ -77,7 +89,7 @@ async def register(
         nom=nom,
         prenom=prenom,
         nom_complet=request.name,
-        type_utilisateur=UserRole.UTILISATEUR,
+        type_utilisateur=role,
         organisation_id=default_org.id,
         est_actif=True,
         email_verifie=False,

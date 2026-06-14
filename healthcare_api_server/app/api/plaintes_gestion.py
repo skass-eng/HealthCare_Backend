@@ -867,8 +867,8 @@ def get_analyses_plainte(
             AnalyseResponse(
                 id=analyse.id,
                 type_analyse=analyse.type_analyse,
-                resultat=analyse.resultat,
-                score_confiance=analyse.score_confiance,
+                resultat=getattr(analyse, "resultats", None),       # le modèle expose 'resultats'
+                score_confiance=getattr(analyse, "score_confiance", None),  # colonne inexistante -> None (plus de 500)
                 date_creation=analyse.date_creation,
                 statut=analyse.statut,
                 plainte_id=analyse.plainte_id
