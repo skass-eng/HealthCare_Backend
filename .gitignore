@@ -13,6 +13,10 @@ logs/
 
 # Virtual environments
 venv/
+
+# Redis / Memurai runtime artifacts
+dump.rdb
+memurai-log.txt
 env/
 .venv/
 .env/

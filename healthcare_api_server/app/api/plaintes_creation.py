@@ -559,20 +559,9 @@ def get_default_service(db: Session = Depends(get_db)):
         logger.error(f"Erreur lors de la récupération du service par défaut: {e}")
         raise HTTPException(status_code=500, detail=f"Erreur interne du serveur: {str(e)}")
 
-@router.options("/nouvelle")
-async def options_create_complaint():
-    """Endpoint OPTIONS pour CORS preflight"""
-    # Utiliser la première origine autorisée ou toutes si plusieurs
-    allowed_origins = ",".join(settings.BACKEND_CORS_ORIGINS)
-    return JSONResponse(
-        content={},
-        headers={
-            "Access-Control-Allow-Origin": settings.BACKEND_CORS_ORIGINS[0] if settings.BACKEND_CORS_ORIGINS else "*",
-            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-            "Access-Control-Allow-Headers": "*",
-            "Access-Control-Allow-Credentials": "true"
-        }
-    )
+# NOTE: la route OPTIONS "/nouvelle" a été retirée. Les preflight CORS sont gérés
+# globalement par CORSMiddleware (cf. main.py, allow_origin_regex). L'ancienne version
+# renvoyait BACKEND_CORS_ORIGINS[0] en dur, ce qui cassait les origines tunnel.
 
 @router.post("/nouvelle", response_model=PlainteResponse)
 async def create_new_complaint(

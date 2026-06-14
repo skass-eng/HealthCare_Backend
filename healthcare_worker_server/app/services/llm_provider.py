@@ -775,9 +775,35 @@ IMPORTANT: Réponds UNIQUEMENT avec un JSON valide, sans texte avant ou après. 
             
         except Exception as e:
             logger.error(f"❌ Erreur Ollama synchrone: {e}")
-            # Fallback vers la simulation
-            return super().generate_response(prompt, parameters)
-    
+            # 🚨 PANNE OLLAMA VISIBLE : on NE supprime PAS le fallback (pour ne pas tout casser),
+            # mais on le rend explicitement detectable plutot que de presenter du faux comme de l'IA.
+            logger.error("⚠️ OLLAMA INDISPONIBLE - BASCULE EN MODE SIMULE (donnees factices)")
+            # Fallback vers la simulation, puis ETIQUETAGE de la sortie
+            fallback_response = super().generate_response(prompt, parameters)
+            return self._mark_fallback_response(fallback_response)
+
+    def _mark_fallback_response(self, response: str) -> str:
+        """
+        Marque la reponse de fallback comme SIMULEE pour qu'on voie immediatement
+        a l'ecran / dans les donnees que ce n'est pas de l'IA reelle.
+        - JSON objet -> ajoute "_fallback": true et "_warning"
+        - Texte      -> prefixe '[MODE SIMULE - Ollama indisponible] '
+        """
+        if response is None:
+            response = ""
+        warning_msg = "Reponse simulee - Ollama indisponible"
+        try:
+            parsed = json.loads(response)
+            if isinstance(parsed, dict):
+                parsed["_fallback"] = True
+                parsed["_warning"] = warning_msg
+                return json.dumps(parsed, ensure_ascii=False)
+            # JSON valide mais pas un objet (liste, scalaire) : on prefixe en texte
+            return f"[MODE SIMULE - Ollama indisponible] {response}"
+        except (json.JSONDecodeError, TypeError):
+            # Pas du JSON : c'est du texte, on prefixe
+            return f"[MODE SIMULE - Ollama indisponible] {response}"
+
     def _extract_json_from_response(self, response: str) -> str:
         """Extrait le JSON d'une réponse qui peut contenir du texte autour"""
         response = response.strip()

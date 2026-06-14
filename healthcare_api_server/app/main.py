@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 import logging
 import asyncio
 import json
+import re
 from datetime import datetime
 from typing import Optional
 import socketio
@@ -237,47 +238,53 @@ if getattr(settings, 'CORS_ALLOW_ALL_ORIGINS', False):
         "http://*.ngrok-free.app",
     ])
 
+# Regex CORS partagée: production pulse-360.fr + tunnels (ngrok, loca.lt, trycloudflare)
+CORS_ALLOW_ORIGIN_REGEX = r"https://.*\.pulse-360\.fr|https://pulse-360\.fr|https://.*\.ngrok(-free)?\.(app|dev)|https://.*\.ngrok\.io|https://.*\.loca\.lt|https://.*\.trycloudflare\.com"
+_cors_origin_pattern = re.compile(CORS_ALLOW_ORIGIN_REGEX)
+
 fastapi_app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,  # Utilise la config centralisée + ngrok
-    allow_origin_regex=r"https://.*\.pulse-360\.fr|https://pulse-360\.fr|https://.*\.ngrok(-free)?\.(app|dev)|https://.*\.ngrok\.io|https://.*\.loca\.lt|https://.*\.trycloudflare\.com",  # Regex pour production et tunnels
+    allow_origin_regex=CORS_ALLOW_ORIGIN_REGEX,  # Regex pour production et tunnels
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
 )
 
-# Middleware de logging des requêtes
+
+def _cors_allowed_origin(origin: str) -> str:
+    """Origine renvoyée si autorisée (liste explicite OU regex tunnels), sinon chaîne vide."""
+    if not origin:
+        return ""
+    if origin in cors_origins or _cors_origin_pattern.match(origin):
+        return origin
+    return ""
+
+
+# Middleware de logging des requêtes.
+# IMPORTANT: on NE court-circuite PAS les requêtes OPTIONS ici. Les preflight CORS sont
+# gérés par CORSMiddleware (qui applique allow_origin_regex). Intercepter OPTIONS avant lui
+# cassait les origines tunnel (trycloudflare/ngrok) absentes de la liste explicite.
 @fastapi_app.middleware("http")
 async def log_requests(request, call_next):
     start_time = datetime.now()
-    
-    # Gérer les requêtes OPTIONS pour CORS preflight
-    origin = request.headers.get("origin", "")
-    allowed_origin = origin if origin in settings.BACKEND_CORS_ORIGINS else ""
-    
-    if request.method == "OPTIONS":
-        response = JSONResponse(content={}, status_code=200)
-        if allowed_origin:
-            response.headers["Access-Control-Allow-Origin"] = allowed_origin
-            response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-            response.headers["Access-Control-Allow-Headers"] = "*"
-            response.headers["Access-Control-Allow-Credentials"] = "true"
-        return response
-    
+
     try:
         response = await call_next(request)
     except Exception as e:
-        # En cas d'erreur, retourner une réponse JSON avec headers CORS
+        # Réponse construite hors CORSMiddleware → on réinjecte les en-têtes CORS à la main,
+        # en validant l'origine via la liste explicite ET la regex tunnels.
         logger.error(f"❌ Erreur non gérée: {e}")
         response = JSONResponse(
             status_code=500,
             content={"detail": str(e)}
         )
+        allowed_origin = _cors_allowed_origin(request.headers.get("origin", ""))
         if allowed_origin:
             response.headers["Access-Control-Allow-Origin"] = allowed_origin
             response.headers["Access-Control-Allow-Credentials"] = "true"
-    
+
     process_time = (datetime.now() - start_time).total_seconds()
     
     logger.info(

@@ -106,8 +106,32 @@ class ComplaintWorkflowOrchestrator:
         """
         logger.info("📄 ÉTAPE 1: Parsing du document")
         
-        # Utiliser la description de la plainte comme texte de base
-        base_text = plainte_data.get('description_probleme', '')
+        # Construire le texte de base a partir des VRAIS champs de la plainte.
+        # NB: la colonne s'appelle 'description' (et non 'description_probleme',
+        # qui n'existe pas) -> sinon base_text vide -> le LLM analyse du vide et
+        # hallucine. On enrichit avec objet/circonstances/consequences/demande
+        # pour une analyse de meilleure qualite.
+        _parts = []
+        _objet = plainte_data.get('titre') or plainte_data.get('objet')
+        if _objet:
+            _parts.append(f"Objet de la plainte : {_objet}")
+        _desc = (
+            plainte_data.get('description')
+            or plainte_data.get('description_probleme')
+            or plainte_data.get('contenu')
+            or ''
+        )
+        if _desc:
+            _parts.append(f"Description : {_desc}")
+        for _key, _label in (
+            ('circonstances', 'Circonstances'),
+            ('consequences', 'Consequences'),
+            ('demande_plaignant', 'Demande du plaignant'),
+        ):
+            _val = plainte_data.get(_key)
+            if _val:
+                _parts.append(f"{_label} : {_val}")
+        base_text = "\n\n".join(_parts)
         
         # Si un document est fourni, tenter de l'analyser
         if document_path and os.path.exists(document_path):

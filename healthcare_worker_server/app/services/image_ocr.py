@@ -209,45 +209,69 @@ class ImageOCRService:
             # 🚀 UN SEUL appel Tesseract qui retourne tout (texte + confiance)
             data = pytesseract.image_to_data(image, config=self.tesseract_config, output_type=pytesseract.Output.DICT)
             
-            # Reconstruire le texte à partir des données (évite le 2ème appel)
-            words = []
+            # Reconstruire le texte à partir des données (évite le 2ème appel).
+            # On regroupe les mots par ligne puis on joint les lignes avec '\n', sans
+            # insérer de marqueurs '\n' parmi les mots (ce qui produisait des " \n " parasites).
+            lines: list[str] = []
+            current_words: list[str] = []
             confidences = []
             current_line = -1
-            
+            word_count = 0
+
             for i, word in enumerate(data['text']):
                 if word.strip():
-                    # Ajouter un saut de ligne si on change de ligne
+                    # Nouvelle ligne détectée: on clôt la ligne courante
                     if data['line_num'][i] != current_line and current_line != -1:
-                        words.append('\n')
+                        lines.append(' '.join(current_words))
+                        current_words = []
                     current_line = data['line_num'][i]
-                    words.append(word)
-                    
+                    current_words.append(word)
+                    word_count += 1
+
                     # Collecter les confiances valides
                     conf = data['conf'][i]
                     if conf != '-1' and int(conf) > 0:
                         confidences.append(int(conf))
-            
-            text = ' '.join(words)
-            
+
+            if current_words:
+                lines.append(' '.join(current_words))
+
+            text = '\n'.join(lines)
+
             # Calcul du score de confiance moyen
             if confidences:
                 avg_confidence = sum(confidences) / len(confidences) / 100.0
             else:
                 avg_confidence = 0.0
-            
+
             return {
                 "text": text,
                 "confidence": avg_confidence,
-                "word_count": len([w for w in words if w.strip() and w != '\n']),
+                "word_count": word_count,
                 "details": {
                     "total_words_detected": len(confidences),
                     "min_confidence": min(confidences) / 100.0 if confidences else 0,
                     "max_confidence": max(confidences) / 100.0 if confidences else 0
                 }
             }
-            
+
         except Exception as e:
-            logger.error(f"❌ Erreur OCR: {e}")
+            logger.error(f"❌ Erreur OCR (image_to_data): {e}")
+            # Repli historique: si image_to_data échoue (parsing TSV/conf), on retente
+            # image_to_string qui est plus tolérant. Évite de renvoyer un texte vide qui
+            # ferait échouer toute l'extraction de la plainte.
+            try:
+                fallback_text = pytesseract.image_to_string(image, config=self.tesseract_config)
+                if fallback_text and fallback_text.strip():
+                    cleaned = fallback_text.strip()
+                    return {
+                        "text": cleaned,
+                        "confidence": 0.5,
+                        "word_count": len(cleaned.split()),
+                        "details": {"fallback": "image_to_string", "error": str(e)}
+                    }
+            except Exception as e2:
+                logger.error(f"❌ Repli OCR (image_to_string) échoué: {e2}")
             return {
                 "text": "",
                 "confidence": 0.0,

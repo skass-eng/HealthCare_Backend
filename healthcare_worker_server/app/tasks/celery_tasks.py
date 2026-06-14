@@ -121,34 +121,58 @@ def process_complaint_complete(self, plainte_id: int, document_path: Optional[st
     4. Compilation et génération du PDF final
     """
     logger.info(f"🚀 Démarrage du traitement complet - Plainte ID: {plainte_id}")
-    
+
+    # 📡 Notifier le DEBUT de l'analyse IA (LIVE observable) - voir CONTRAT COMMUN
+    notify_websocket("ai_analysis_started", {"plainte_id": plainte_id})
+
     try:
         # Initialiser les services
         initialize_services()
-        
+
         # Récupérer les données de la plainte
         plainte_data = get_plainte_data(plainte_id)
         if not plainte_data:
             error_msg = f"Plainte {plainte_id} non trouvée en base de données"
             logger.error(error_msg)
+            # 📡 Notifier la fin (échec) pour ne pas laisser le front en attente
+            notify_websocket("ai_analysis_complete", {
+                "plainte_id": plainte_id,
+                "statut": "complete",
+                "success": False
+            })
             return {"success": False, "error": error_msg}
-        
+
         # Exécuter le workflow complet via l'orchestrateur
         workflow_result = _orchestrator.process_complaint_complete(plainte_data, document_path)
-        
+
         # Sauvegarder les résultats en base
         save_analysis_results(plainte_id, workflow_result)
-        
+
         # Mettre à jour le statut de la plainte
         update_plainte_status(plainte_id, "ANALYSEE" if workflow_result["success"] else "ERREUR_ANALYSE")
-        
+
         logger.info(f"✅ Traitement complet terminé - Plainte ID: {plainte_id}")
+
+        # 📡 Notifier la FIN de l'analyse IA (LIVE observable) - voir CONTRAT COMMUN
+        # Event type='ai_analysis_complete', data={plainte_id, statut:'complete', success}
+        notify_websocket("ai_analysis_complete", {
+            "plainte_id": plainte_id,
+            "statut": "complete",
+            "success": bool(workflow_result.get("success", False))
+        })
+
         return workflow_result
-        
+
     except Exception as e:
         error_msg = f"Erreur lors du traitement complet: {str(e)}"
         logger.error(error_msg)
         update_plainte_status(plainte_id, "ERREUR_ANALYSE")
+        # 📡 Notifier la fin (échec) - voir CONTRAT COMMUN
+        notify_websocket("ai_analysis_complete", {
+            "plainte_id": plainte_id,
+            "statut": "complete",
+            "success": False
+        })
         return {"success": False, "error": error_msg, "plainte_id": plainte_id}
 
 @app.task(bind=True, name="parse_document_only")
@@ -358,6 +382,44 @@ def get_plainte_data(plainte_id: int) -> Optional[Dict[str, Any]]:
         logger.error(f"Erreur lors de la récupération de la plainte: {str(e)}")
         return None
 
+def generer_numero_plainte_unique(db, prefix: Optional[str] = None) -> str:
+    """Génère un numéro de plainte unique (PL_YYYY_NNNN).
+
+    Cherche le dernier numéro, incrémente, puis garantit l'unicité avec une garde
+    anti-boucle (max 100 tentatives) et un repli UUID. Centralise une logique qui
+    était dupliquée entre les tâches d'archive (une copie n'avait aucune garde).
+    """
+    if prefix is None:
+        prefix = f"PL_{datetime.now().year}_"
+
+    last_plainte = db.query(Plainte.numero_plainte).filter(
+        Plainte.numero_plainte.like(f"{prefix}%")
+    ).order_by(Plainte.numero_plainte.desc()).first()
+
+    if last_plainte and last_plainte[0]:
+        try:
+            next_num = int(last_plainte[0].replace(prefix, "")) + 1
+        except ValueError:
+            next_num = 1
+    else:
+        next_num = 1
+
+    numero_plainte = f"{prefix}{str(next_num).zfill(4)}"
+
+    # Garde anti-boucle: garantit la terminaison même en cas d'état DB pathologique.
+    max_attempts = 100
+    attempts = 0
+    while db.query(Plainte).filter(Plainte.numero_plainte == numero_plainte).first() and attempts < max_attempts:
+        next_num += 1
+        numero_plainte = f"{prefix}{str(next_num).zfill(4)}"
+        attempts += 1
+
+    if attempts >= max_attempts:
+        import uuid
+        numero_plainte = f"{prefix}{str(uuid.uuid4())[:8].upper()}"
+
+    return numero_plainte
+
 def save_analysis_results(plainte_id: int, workflow_result: Dict[str, Any]):
     """Sauvegarde tous les résultats d'analyse dans la table analyses_ia - crée l'entrée si elle n'existe pas"""
     try:
@@ -369,14 +431,34 @@ def save_analysis_results(plainte_id: int, workflow_result: Dict[str, Any]):
             # Extraire le sentiment
             sentiment_data = analysis_results.get("sentiment", {})
             sentiment_content = sentiment_data.get("content", "{}")
+            # Toujours initialiser sentiment_json: le bloc mots-clés plus bas l'utilise et
+            # lèverait sinon un NameError (avalé par un except nu) quand le parsing échoue.
+            sentiment_json: Dict[str, Any] = {}
             try:
-                sentiment_json = json.loads(sentiment_content) if isinstance(sentiment_content, str) else sentiment_content
+                parsed_sentiment = json.loads(sentiment_content) if isinstance(sentiment_content, str) else sentiment_content
+                if isinstance(parsed_sentiment, dict):
+                    sentiment_json = parsed_sentiment
                 sentiment = sentiment_json.get("sentiment_principal", "neutre")
                 score_sentiment = sentiment_json.get("score_sentiment", 0.5)
-            except:
+            except (json.JSONDecodeError, TypeError, ValueError) as e:
+                logger.warning(f"⚠️ Parsing sentiment impossible, valeurs par défaut: {e}")
                 sentiment = "neutre"
                 score_sentiment = 0.5
-            
+
+            # Normaliser le score vers [-1, 1] (CONTRAT COMMUN: score_sentiment stocke en [-1,1])
+            # Tolere les formats 0-1 ou 0-100 si l'IA renvoie une echelle differente.
+            try:
+                score_sentiment = float(score_sentiment)
+            except (TypeError, ValueError):
+                score_sentiment = 0.0
+            if score_sentiment > 1.0:
+                # Echelle 0-100 -> [-1,1] ; sinon (1, 100]) traitee comme 0-100
+                score_sentiment = (score_sentiment / 100.0) * 2.0 - 1.0
+            elif score_sentiment < -1.0:
+                score_sentiment = -1.0
+            # Clamp final de securite
+            score_sentiment = max(-1.0, min(1.0, score_sentiment))
+
             # Extraire le résumé
             summary_data = analysis_results.get("summary", {})
             summary_content = summary_data.get("content", "{}")
@@ -399,13 +481,13 @@ def save_analysis_results(plainte_id: int, workflow_result: Dict[str, Any]):
                 except:
                     reponse_suggeree = legal_content
             
-            # Extraire les mots-clés
+            # Extraire les mots-clés (sentiment_json est toujours un dict, cf. plus haut)
             mots_cles = []
             try:
                 if sentiment_json.get("mots_cles_emotionnels"):
                     mots_cles = sentiment_json.get("mots_cles_emotionnels", [])
-            except:
-                pass
+            except (AttributeError, TypeError) as e:
+                logger.warning(f"⚠️ Extraction mots-clés impossible: {e}")
             
             # INSÉRER OU METTRE À JOUR l'entrée analyses_ia (crée si n'existe pas)
             session.execute(
@@ -440,8 +522,17 @@ def save_analysis_results(plainte_id: int, workflow_result: Dict[str, Any]):
                     "statut_analyse": "complete" if workflow_result.get("success") else "erreur"
                 }
             )
+
+            # 📊 Repercuter le score_sentiment ([-1,1]) sur la plainte elle-meme
+            # pour que la "Satisfaction patient" du dashboard reflete les creations LIVE.
+            # CONTRAT COMMUN: plaintes.score_sentiment ET analyses_ia.score_sentiment en [-1,1].
+            session.execute(
+                text("UPDATE plaintes SET score_sentiment = :score_sentiment WHERE id = :plainte_id"),
+                {"score_sentiment": score_sentiment, "plainte_id": plainte_id}
+            )
+
             session.commit()
-            logger.info(f"✅ Résultats d'analyse sauvegardés pour plainte {plainte_id}")
+            logger.info(f"✅ Résultats d'analyse sauvegardés pour plainte {plainte_id} (score_sentiment={score_sentiment:.3f})")
     except Exception as e:
         logger.error(f"Erreur lors de la sauvegarde des résultats: {str(e)}")
 
@@ -1176,30 +1267,9 @@ def process_archive_file_async(
                     else:
                         raise Exception("Aucun service disponible dans la base de données")
             
-            # Générer numéro de plainte
-            current_year = datetime.now().year
-            prefix = f"PL_{current_year}_"
-            
-            last_plainte = db.query(Plainte.numero_plainte).filter(
-                Plainte.numero_plainte.like(f"{prefix}%")
-            ).order_by(Plainte.numero_plainte.desc()).first()
-            
-            if last_plainte and last_plainte[0]:
-                try:
-                    last_num = int(last_plainte[0].replace(prefix, ""))
-                    next_num = last_num + 1
-                except ValueError:
-                    next_num = 1
-            else:
-                next_num = 1
-            
-            numero_plainte = f"{prefix}{str(next_num).zfill(4)}"
-            
-            # Vérifier unicité
-            while db.query(Plainte).filter(Plainte.numero_plainte == numero_plainte).first():
-                next_num += 1
-                numero_plainte = f"{prefix}{str(next_num).zfill(4)}"
-            
+            # Générer numéro de plainte (helper centralisé avec garde anti-boucle + repli UUID)
+            numero_plainte = generer_numero_plainte_unique(db)
+
             # Créer la plainte
             try:
                 priorite_enum = PrioritePlainte(priorite.upper())
@@ -1665,38 +1735,9 @@ def process_single_archive_file(
             else:
                 return {"success": False, "filename": filename, "error": "Aucun service disponible"}
     
-    # Générer numéro de plainte (même logique que plaintes_creation.py)
-    current_year = datetime.now().year
-    prefix = f"PL_{current_year}_"
-    
-    last_plainte = db.query(Plainte.numero_plainte).filter(
-        Plainte.numero_plainte.like(f"{prefix}%")
-    ).order_by(Plainte.numero_plainte.desc()).first()
-    
-    if last_plainte and last_plainte[0]:
-        try:
-            last_num = int(last_plainte[0].replace(prefix, ""))
-            next_num = last_num + 1
-        except ValueError:
-            next_num = 1
-    else:
-        next_num = 1
-    
-    numero_plainte = f"{prefix}{str(next_num).zfill(4)}"
-    
-    # Vérification de sécurité: s'assurer que le numéro n'existe pas déjà
-    max_attempts = 100  # Éviter boucle infinie
-    attempts = 0
-    while db.query(Plainte).filter(Plainte.numero_plainte == numero_plainte).first() and attempts < max_attempts:
-        next_num += 1
-        numero_plainte = f"{prefix}{str(next_num).zfill(4)}"
-        attempts += 1
-    
-    if attempts >= max_attempts:
-        # Fallback: utiliser un UUID partiel pour garantir l'unicité
-        import uuid
-        numero_plainte = f"{prefix}{str(uuid.uuid4())[:8].upper()}"
-    
+    # Générer numéro de plainte (helper centralisé, même logique que plaintes_creation.py)
+    numero_plainte = generer_numero_plainte_unique(db)
+
     logger.info(f"📝 [Archive] Numéro de plainte généré: {numero_plainte}")
     
     # Créer la plainte
