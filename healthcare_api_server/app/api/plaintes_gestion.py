@@ -6,7 +6,7 @@ Toutes les opérations SAUF la création des plaintes
 Version: 1.0.0 - Architecture ODYSSEE
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks, Body
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import and_, or_, desc, func, case
@@ -26,6 +26,8 @@ from shared.schemas import (
 # from ..core.auth import get_current_user  # Désactivé pour le développement
 from ..services.task_manager import trigger_analyse_plainte
 from ..services.audit import log_audit, get_historique
+from ..services.notifications import send_email_safe
+from ..core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -380,6 +382,11 @@ def get_plainte(plainte_id: int, db: Session = Depends(get_db)):
             "date_resolution": plainte.date_resolution.isoformat() if plainte.date_resolution else None,
             "est_en_retard": plainte.est_en_retard,
             "jours_restants": plainte.jours_restants,
+            "reponse_redigee": plainte.reponse_redigee,
+            "reponse_envoyee": bool(plainte.reponse_envoyee),
+            "date_reponse_envoyee": plainte.date_reponse_envoyee.isoformat() if plainte.date_reponse_envoyee else None,
+            "accuse_reception_envoye": bool(plainte.accuse_reception_envoye),
+            "date_accuse_reception": plainte.date_accuse_reception.isoformat() if plainte.date_accuse_reception else None,
             "service_id": plainte.service_id,
             "service": {
                 "id": plainte.service.id,
@@ -658,6 +665,68 @@ async def get_plainte_historique(plainte_id: int, db: Session = Depends(get_db))
     if not plainte:
         raise HTTPException(status_code=404, detail="Plainte non trouvée")
     return {"plainte_id": plainte_id, "historique": get_historique(db, "plainte", plainte_id)}
+
+
+@router.put("/{plainte_id}/reponse")
+async def save_reponse(plainte_id: int, contenu: str = Body(..., embed=True), db: Session = Depends(get_db)):
+    """Sauvegarder (brouillon) la réponse officielle rédigée par le responsable qualité."""
+    plainte = db.query(Plainte).filter(Plainte.id == plainte_id).first()
+    if not plainte:
+        raise HTTPException(status_code=404, detail="Plainte non trouvée")
+    plainte.reponse_redigee = contenu
+    plainte.date_modification = datetime.now()
+    db.commit()
+    log_audit(db, "reponse_redigee", "plainte", plainte_id, details={"longueur": len(contenu or "")})
+    db.commit()
+    return {"plainte_id": plainte_id, "reponse_redigee": plainte.reponse_redigee, "message": "Réponse enregistrée"}
+
+
+@router.post("/{plainte_id}/reponse/envoyer")
+async def envoyer_reponse(plainte_id: int, db: Session = Depends(get_db)):
+    """Marquer la réponse officielle comme envoyée (email si SMTP configuré, sinon enregistrée)."""
+    plainte = db.query(Plainte).filter(Plainte.id == plainte_id).first()
+    if not plainte:
+        raise HTTPException(status_code=404, detail="Plainte non trouvée")
+    if not (plainte.reponse_redigee or "").strip():
+        raise HTTPException(status_code=400, detail="Aucune réponse rédigée à envoyer")
+    envoye = send_email_safe(
+        settings, plainte.email_plaignant or "",
+        f"Réponse à votre réclamation {plainte.numero_plainte}", plainte.reponse_redigee,
+    )
+    plainte.reponse_envoyee = True
+    plainte.date_reponse_envoyee = datetime.now()
+    db.commit()
+    log_audit(db, "reponse_envoyee", "plainte", plainte_id,
+              details={"email": plainte.email_plaignant, "email_reel_envoye": envoye})
+    db.commit()
+    return {"plainte_id": plainte_id, "reponse_envoyee": True,
+            "date_reponse_envoyee": plainte.date_reponse_envoyee.isoformat(),
+            "email_reel_envoye": envoye}
+
+
+@router.post("/{plainte_id}/accuse-reception")
+async def envoyer_accuse_reception(plainte_id: int, db: Session = Depends(get_db)):
+    """Émettre l'accusé de réception au plaignant (email si SMTP configuré, sinon enregistré)."""
+    plainte = db.query(Plainte).filter(Plainte.id == plainte_id).first()
+    if not plainte:
+        raise HTTPException(status_code=404, detail="Plainte non trouvée")
+    delai = plainte.date_limite_reponse.isoformat() if plainte.date_limite_reponse else "le délai légal"
+    corps = (
+        f"Madame, Monsieur,\n\nNous accusons réception de votre réclamation "
+        f"n°{plainte.numero_plainte}. Elle est en cours d'instruction et vous recevrez "
+        f"une réponse au plus tard le {delai}.\n\nLe Responsable Qualité"
+    )
+    envoye = send_email_safe(settings, plainte.email_plaignant or "",
+                             f"Accusé de réception — réclamation {plainte.numero_plainte}", corps)
+    plainte.accuse_reception_envoye = True
+    plainte.date_accuse_reception = datetime.now()
+    db.commit()
+    log_audit(db, "accuse_reception", "plainte", plainte_id,
+              details={"email": plainte.email_plaignant, "email_reel_envoye": envoye})
+    db.commit()
+    return {"plainte_id": plainte_id, "accuse_reception_envoye": True,
+            "date_accuse_reception": plainte.date_accuse_reception.isoformat(),
+            "email_reel_envoye": envoye}
 
 
 @router.delete("/{plainte_id}")

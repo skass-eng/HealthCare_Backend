@@ -280,7 +280,14 @@ class Plainte(Base):
     date_creation = Column(DateTime, nullable=False, default=datetime.utcnow, server_default=func.now())
     date_modification = Column(DateTime, onupdate=func.now())
     date_suppression = Column(DateTime)
-    
+
+    # Réponse officielle au plaignant + accusé de réception (cycle qualité)
+    reponse_redigee = Column(Text)                       # réponse officielle éditée par le responsable qualité
+    reponse_envoyee = Column(Boolean, default=False)
+    date_reponse_envoyee = Column(DateTime)
+    accuse_reception_envoye = Column(Boolean, default=False)
+    date_accuse_reception = Column(DateTime)
+
     # Relations simplifiées
     service = relationship("Service", back_populates="plaintes")
     createur = relationship("User", foreign_keys=[cree_par_id], back_populates="plaintes_creees")
