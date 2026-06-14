@@ -25,6 +25,7 @@ from shared.schemas import (
 )
 # from ..core.auth import get_current_user  # Désactivé pour le développement
 from ..services.task_manager import trigger_analyse_plainte
+from ..services.audit import log_audit, get_historique
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,7 @@ def get_plaintes(
     statut: Optional[str] = Query(None, description="Filtrer par statut"),
     service_id: Optional[int] = Query(None, description="Filtrer par service"),
     assigned_user_id: Optional[int] = Query(None, description="Filtrer par utilisateur assigné"),
+    en_retard: Optional[bool] = Query(None, description="Filtrer les plaintes en retard (délai dépassé, non clôturées)"),
     search: Optional[str] = Query(None, description="Recherche dans titre et description"),
     date_debut: Optional[datetime] = Query(None, description="Date de début (format: YYYY-MM-DD)"),
     date_fin: Optional[datetime] = Query(None, description="Date de fin (format: YYYY-MM-DD)"),
@@ -68,6 +70,15 @@ def get_plaintes(
 
         if assigned_user_id:
             query = query.filter(Plainte.assigned_user_id == assigned_user_id)
+
+        if en_retard is not None:
+            today = datetime.now().date()
+            overdue = and_(
+                Plainte.date_limite_reponse.isnot(None),
+                Plainte.date_limite_reponse < today,
+                Plainte.statut.notin_([StatutPlainte.TRAITE, StatutPlainte.CLOTURE]),
+            )
+            query = query.filter(overdue if en_retard else ~overdue)
 
         if search:
             search_filter = or_(
@@ -122,6 +133,10 @@ def get_plaintes(
                 "date_creation": plainte.date_creation.isoformat() if plainte.date_creation else None,
                 "date_modification": plainte.date_modification.isoformat() if plainte.date_modification else None,
                 "date_incident": plainte.date_incident.isoformat() if plainte.date_incident else None,
+                "date_limite_reponse": plainte.date_limite_reponse.isoformat() if plainte.date_limite_reponse else None,
+                "date_resolution": plainte.date_resolution.isoformat() if plainte.date_resolution else None,
+                "est_en_retard": plainte.est_en_retard,
+                "jours_restants": plainte.jours_restants,
                 "assigned_user": {
                     "id": plainte.assigned_user.id,
                     "nom": plainte.assigned_user.nom,
@@ -361,6 +376,10 @@ def get_plainte(plainte_id: int, db: Session = Depends(get_db)):
             "date_incident": plainte.date_incident.isoformat() if plainte.date_incident else None,
             "date_creation": plainte.date_creation.isoformat() if plainte.date_creation else None,
             "date_modification": plainte.date_modification.isoformat() if plainte.date_modification else None,
+            "date_limite_reponse": plainte.date_limite_reponse.isoformat() if plainte.date_limite_reponse else None,
+            "date_resolution": plainte.date_resolution.isoformat() if plainte.date_resolution else None,
+            "est_en_retard": plainte.est_en_retard,
+            "jours_restants": plainte.jours_restants,
             "service_id": plainte.service_id,
             "service": {
                 "id": plainte.service.id,
@@ -557,17 +576,39 @@ async def update_plainte(
         if not plainte:
             raise HTTPException(status_code=404, detail="Plainte non trouvée")
 
+        # Capturer l'état AVANT pour la traçabilité (audit_logs)
+        ancien_statut = plainte.statut.value if plainte.statut else None
+        ancien_assignee = plainte.assignee_a_id
+        ancienne_priorite = plainte.priorite.value if plainte.priorite else None
+
         # Mise à jour des champs modifiés
         update_data = plainte_data.dict(exclude_unset=True)
-        
+
         for field, value in update_data.items():
             if hasattr(plainte, field):
                 setattr(plainte, field, value)
 
         plainte.date_modification = datetime.now()
-        
+        # NB: date_resolution est posée/retirée automatiquement par l'event listener
+        # `_plainte_set_resolution` selon le nouveau statut (cf. shared/models.py).
+
         db.commit()
         db.refresh(plainte)
+
+        # Traçabilité : une entrée d'audit par changement significatif
+        nouveau_statut = plainte.statut.value if plainte.statut else None
+        if nouveau_statut != ancien_statut:
+            log_audit(db, "changement_statut", "plainte", plainte_id,
+                      donnees_avant={"statut": ancien_statut}, donnees_apres={"statut": nouveau_statut})
+        if plainte.assignee_a_id != ancien_assignee:
+            log_audit(db, "reaffectation", "plainte", plainte_id,
+                      donnees_avant={"assignee_a_id": ancien_assignee},
+                      donnees_apres={"assignee_a_id": plainte.assignee_a_id})
+        nouvelle_priorite = plainte.priorite.value if plainte.priorite else None
+        if nouvelle_priorite != ancienne_priorite:
+            log_audit(db, "changement_priorite", "plainte", plainte_id,
+                      donnees_avant={"priorite": ancienne_priorite}, donnees_apres={"priorite": nouvelle_priorite})
+        db.commit()
 
         # Charger les relations pour la réponse
         plainte_updated = db.query(Plainte).options(
@@ -593,6 +634,10 @@ async def update_plainte(
             "priorite": plainte_updated.priorite.value if plainte_updated.priorite else "MOYEN",
             "date_creation": plainte_updated.date_creation.isoformat() if plainte_updated.date_creation else None,
             "date_modification": plainte_updated.date_modification.isoformat() if plainte_updated.date_modification else None,
+            "date_limite_reponse": plainte_updated.date_limite_reponse.isoformat() if plainte_updated.date_limite_reponse else None,
+            "date_resolution": plainte_updated.date_resolution.isoformat() if plainte_updated.date_resolution else None,
+            "est_en_retard": plainte_updated.est_en_retard,
+            "jours_restants": plainte_updated.jours_restants,
             "service": {
                 "id": plainte_updated.service.id,
                 "nom": plainte_updated.service.nom
@@ -605,6 +650,15 @@ async def update_plainte(
         db.rollback()
         logger.error(f"❌ Erreur lors de la mise à jour de la plainte {plainte_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/{plainte_id}/historique")
+async def get_plainte_historique(plainte_id: int, db: Session = Depends(get_db)):
+    """Historique de traçabilité d'une plainte (audit_logs), du plus récent au plus ancien."""
+    plainte = db.query(Plainte).filter(Plainte.id == plainte_id).first()
+    if not plainte:
+        raise HTTPException(status_code=404, detail="Plainte non trouvée")
+    return {"plainte_id": plainte_id, "historique": get_historique(db, "plainte", plainte_id)}
+
 
 @router.delete("/{plainte_id}")
 async def delete_plainte(plainte_id: int, db: Session = Depends(get_db)):
