@@ -18,7 +18,7 @@ from pathlib import Path
 import os
 
 from ..db.database import get_db
-from shared.models import Plainte, User, Service, Analyse, StatutPlainte, DocumentPlainte, AnalyseIA
+from shared.models import Plainte, User, Service, Analyse, StatutPlainte, DocumentPlainte, AnalyseIA, NotePlainte
 from shared.schemas import (
     PlainteCreate, PlainteUpdate, PlainteResponse,
     AnalyseTaskRequest, TaskStatus, PaginatedResponse, AnalyseResponse, DocumentPlainteResponse
@@ -727,6 +727,57 @@ async def envoyer_accuse_reception(plainte_id: int, db: Session = Depends(get_db
     return {"plainte_id": plainte_id, "accuse_reception_envoye": True,
             "date_accuse_reception": plainte.date_accuse_reception.isoformat(),
             "email_reel_envoye": envoye}
+
+
+@router.get("/{plainte_id}/notes")
+async def list_notes(plainte_id: int, db: Session = Depends(get_db)):
+    """Lister les notes d'instruction d'une plainte (plus récentes d'abord)."""
+    plainte = db.query(Plainte).filter(Plainte.id == plainte_id).first()
+    if not plainte:
+        raise HTTPException(status_code=404, detail="Plainte non trouvée")
+    notes = (
+        db.query(NotePlainte)
+        .filter(NotePlainte.plainte_id == plainte_id)
+        .order_by(NotePlainte.date_creation.desc())
+        .all()
+    )
+    return {
+        "plainte_id": plainte_id,
+        "notes": [
+            {
+                "id": n.id,
+                "contenu": n.contenu,
+                "auteur_id": n.auteur_id,
+                "auteur": f"{n.auteur.prenom} {n.auteur.nom}" if n.auteur else None,
+                "date_creation": n.date_creation.isoformat() if n.date_creation else None,
+            }
+            for n in notes
+        ],
+    }
+
+
+@router.post("/{plainte_id}/notes")
+async def add_note(plainte_id: int, contenu: str = Body(..., embed=True),
+                   auteur_id: Optional[int] = Body(None, embed=True), db: Session = Depends(get_db)):
+    """Ajouter une note d'instruction interne à une plainte."""
+    plainte = db.query(Plainte).filter(Plainte.id == plainte_id).first()
+    if not plainte:
+        raise HTTPException(status_code=404, detail="Plainte non trouvée")
+    if not (contenu or "").strip():
+        raise HTTPException(status_code=400, detail="Le contenu de la note est requis")
+    note = NotePlainte(plainte_id=plainte_id, contenu=contenu, auteur_id=auteur_id)
+    db.add(note)
+    db.commit()
+    db.refresh(note)
+    log_audit(db, "note_ajoutee", "plainte", plainte_id, user_id=auteur_id, details={"note_id": note.id})
+    db.commit()
+    return {
+        "id": note.id,
+        "plainte_id": plainte_id,
+        "contenu": note.contenu,
+        "auteur_id": note.auteur_id,
+        "date_creation": note.date_creation.isoformat() if note.date_creation else None,
+    }
 
 
 @router.delete("/{plainte_id}")

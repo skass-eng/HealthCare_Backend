@@ -475,6 +475,18 @@ class AnalyseIA(Base):
     # Relations
     plainte = relationship("Plainte", back_populates="analyse_ia")
 
+class NotePlainte(Base):
+    """Note d'instruction interne attachée à une plainte (investigation, échanges)."""
+    __tablename__ = "notes_plaintes"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    plainte_id = Column(BigInteger, ForeignKey("plaintes.id", ondelete="CASCADE"), nullable=False, index=True)
+    auteur_id = Column(Integer, ForeignKey("utilisateurs.id"))
+    contenu = Column(Text, nullable=False)
+    date_creation = Column(DateTime, server_default=func.now())
+
+    auteur = relationship("User")
+
 class AuditLog(Base):
     """
     Journal d'audit inspiré d'ODYSSEE

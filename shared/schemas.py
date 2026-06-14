@@ -126,7 +126,9 @@ class PlainteUpdate(BaseModel):
     statut: Optional[StatutPlainte] = None
     priorite: Optional[PrioritePlainte] = None
     service_id: Optional[int] = None
+    assignee_a_id: Optional[int] = None
     date_incident: Optional[datetime] = None
+    reponse_redigee: Optional[str] = None
     # Informations du plaignant
     nom_plaignant: Optional[str] = None
     prenom_plaignant: Optional[str] = None
