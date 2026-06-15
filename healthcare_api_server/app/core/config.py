@@ -6,10 +6,16 @@ Version: 1.0.0 - Architecture ODYSSEE
 """
 
 import os
+import logging
 from typing import List, Optional
 from pydantic import PostgresDsn, RedisDsn
 from pydantic_settings import BaseSettings
 from functools import lru_cache
+
+logger = logging.getLogger(__name__)
+
+# Valeur placeholder publique par défaut (NE PAS utiliser en production)
+_SECRET_KEY_PLACEHOLDER = "your-secret-key-change-in-production"
 
 class Settings(BaseSettings):
     """Configuration de l'application (inspirée d'ODYSSEE)"""
@@ -61,7 +67,8 @@ class Settings(BaseSettings):
     }
     
     # Configuration sécurité (comme ODYSSEE)
-    SECRET_KEY: str = "your-secret-key-change-in-production"
+    # Lue depuis l'env SECRET_KEY si définie, sinon placeholder (comportement inchangé).
+    SECRET_KEY: str = os.getenv("SECRET_KEY", _SECRET_KEY_PLACEHOLDER)
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 480
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
@@ -112,6 +119,14 @@ def get_settings() -> Settings:
 
 # Instance globale
 settings = get_settings()
+
+# Avertissement clair au boot si la SECRET_KEY reste le placeholder public.
+# (On NE fait PAS crasher l'app pour ne pas casser la démo.)
+if settings.SECRET_KEY == _SECRET_KEY_PLACEHOLDER:
+    logger.warning(
+        "SECRET_KEY utilise la valeur placeholder publique par defaut. "
+        "Definissez la variable d'environnement SECRET_KEY avant tout deploiement reel."
+    )
 
 # Configuration pour différents environnements
 def get_database_url() -> str:

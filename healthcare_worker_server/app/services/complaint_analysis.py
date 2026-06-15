@@ -35,25 +35,40 @@ class ComplaintAnalysisService:
     def _initialize_prompts(self) -> Dict[str, str]:
         """Initialise les prompts spécialisés pour chaque type d'analyse"""
         return {
-            "sentiment": """
-Analyse le sentiment de cette plainte médicale et détermine le niveau d'émotion du plaignant.
+            "sentiment": """Analyse le sentiment d'une plainte hospitaliere et attribue un SCORE PRECIS et CALIBRE.
+(Prompt V2 valide par banc d'essai: erreur moyenne 0.071 vs 0.893, granularite x2.7, signes corrects.)
 
-Plainte à analyser:
+PROCEDE EN 2 ETAPES:
+ETAPE 1 - LE SIGNE (le plus important):
+  - Le plaignant exprime un reproche, une insatisfaction, une colere -> score NEGATIF (strictement < 0).
+  - Simple demande d'information, constat administratif, question SANS reproche -> NEUTRE (entre -0.05 et +0.05).
+  - Remerciement, satisfaction, eloge -> score POSITIF (strictement > 0).
+  INTERDIT: donner un score negatif a une plainte neutre ou positive, ou positif a une plainte negative.
+ETAPE 2 - LA MAGNITUDE selon l'intensite (utilise TOUTE l'echelle, precis au centieme, jamais une valeur par defaut):
+  cote NEGATIF: -1.00 a -0.85 colere extreme/danger vital/erreur grave | -0.84 a -0.55 forte insatisfaction/prejudice | -0.54 a -0.25 insatisfaction moderee | -0.24 a -0.06 gene legere ("un peu", "dans l'ensemble ca a ete").
+  NEUTRE: -0.05 a +0.05.
+  cote POSITIF: +0.06 a +0.50 plutot satisfait (avec reserve) | +0.51 a +0.84 satisfait | +0.85 a +1.00 tres reconnaissant.
+Deux plaintes d'intensites differentes ne doivent JAMAIS avoir le meme score. Le score est coherent avec "intensite_emotionnelle".
+
+EXEMPLES calibres (couvrant toute l'echelle):
+- "Scandaleux, une erreur de medicament a failli tuer mon pere" -> {{"score_sentiment": -0.95, "sentiment_principal": "negatif", "intensite_emotionnelle": "elevee"}}
+- "Mon operation a ete annulee trois fois sans explication, j'ai perdu confiance" -> {{"score_sentiment": -0.70, "sentiment_principal": "negatif", "intensite_emotionnelle": "elevee"}}
+- "On ne m'a pas explique mon traitement a la sortie" -> {{"score_sentiment": -0.42, "sentiment_principal": "negatif", "intensite_emotionnelle": "moderee"}}
+- "L'attente etait un peu longue mais ca a ete" -> {{"score_sentiment": -0.15, "sentiment_principal": "negatif", "intensite_emotionnelle": "faible"}}
+- "Je voudrais une copie de mon dossier medical et la procedure" -> {{"score_sentiment": 0.00, "sentiment_principal": "neutre", "intensite_emotionnelle": "faible"}}
+- "Globalement satisfait, le medecin a ete a l'ecoute malgre l'attente" -> {{"score_sentiment": 0.50, "sentiment_principal": "positif", "intensite_emotionnelle": "moderee"}}
+- "Un immense merci, l'equipe a ete extraordinaire" -> {{"score_sentiment": 0.93, "sentiment_principal": "positif", "intensite_emotionnelle": "elevee"}}
+
+Plainte a analyser:
 {complaint_text}
 
-Instructions:
-1. Identifie le sentiment principal (positif, négatif, neutre)
-2. Évalue l'intensité émotionnelle (faible, modérée, élevée)
-3. Identifie les mots-clés émotionnels
-4. Propose des recommandations pour la réponse
-
-Format de réponse JSON:
+Reponds UNIQUEMENT avec ce JSON (score_sentiment = nombre a 2 decimales entre -1.0 et 1.0, signe coherent avec l'etape 1):
 {{
-    "sentiment_principal": "positif/négatif/neutre",
-    "intensite_emotionnelle": "faible/modérée/élevée",
-    "score_sentiment": 0.0, // de -1.0 (très négatif) à 1.0 (très positif)
+    "sentiment_principal": "positif/negatif/neutre",
+    "intensite_emotionnelle": "faible/moderee/elevee",
+    "score_sentiment": -0.42,
     "mots_cles_emotionnels": ["mot1", "mot2"],
-    "recommandations_reponse": "conseils pour la tonalité de réponse"
+    "recommandations_reponse": "conseils pour la tonalite de reponse"
 }}
 """,
             

@@ -23,7 +23,7 @@ from shared.schemas import (
     PlainteCreate, PlainteUpdate, PlainteResponse,
     AnalyseTaskRequest, TaskStatus, PaginatedResponse, AnalyseResponse, DocumentPlainteResponse
 )
-# from ..core.auth import get_current_user  # Désactivé pour le développement
+from ..core.auth import get_current_user  # protège uniquement le DELETE (cf. delete_plainte)
 from ..services.task_manager import trigger_analyse_plainte
 from ..services.audit import log_audit, get_historique
 from ..services.notifications import send_email_safe
@@ -71,7 +71,8 @@ def get_plaintes(
             query = query.filter(Plainte.service_id == service_id)
 
         if assigned_user_id:
-            query = query.filter(Plainte.assigned_user_id == assigned_user_id)
+            # La colonne réelle du modèle est `assignee_a_id` (pas `assigned_user_id`)
+            query = query.filter(Plainte.assignee_a_id == assigned_user_id)
 
         if en_retard is not None:
             today = datetime.now().date()
@@ -261,7 +262,7 @@ async def export_plaintes(
                 plaintes_data.append({
                     "id": plainte.id,
                     "titre": plainte.titre,
-                    "contenu": plainte.contenu,
+                    "contenu": plainte.description,  # champ réel = description
                     "nom_plaignant": plainte.nom_plaignant,
                     "prenom_plaignant": plainte.prenom_plaignant,
                     "email_plaignant": plainte.email_plaignant,
@@ -269,7 +270,7 @@ async def export_plaintes(
                     "mode_reception": plainte.mode_reception,
                     "statut": plainte.statut.value if plainte.statut else None,
                     "date_creation": plainte.date_creation.isoformat() if plainte.date_creation else None,
-                    "date_mise_a_jour": plainte.date_mise_a_jour.isoformat() if plainte.date_mise_a_jour else None,
+                    "date_mise_a_jour": plainte.date_modification.isoformat() if plainte.date_modification else None,  # champ réel = date_modification
                     "service": plainte.service.nom if plainte.service else None,
                     "assigned_user": f"{plainte.assigned_user.prenom} {plainte.assigned_user.nom}" if plainte.assigned_user else None
                 })
@@ -781,9 +782,13 @@ async def add_note(plainte_id: int, contenu: str = Body(..., embed=True),
 
 
 @router.delete("/{plainte_id}")
-async def delete_plainte(plainte_id: int, db: Session = Depends(get_db)):
+async def delete_plainte(
+    plainte_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """
-    Supprimer une plainte
+    Supprimer une plainte (authentification requise — le front attache le token Bearer).
     """
     try:
         plainte = db.query(Plainte).filter(Plainte.id == plainte_id).first()
@@ -863,15 +868,25 @@ def get_analyses_plainte(
 
         analyses = query.order_by(desc(Analyse.date_creation)).all()
 
+        # Le modèle Analyse expose: id, plainte_id, type_analyse, statut, resultats (JSONB),
+        # parametres_entree, task_id, duree_execution, erreur_message, analyste_id,
+        # date_creation/date_modification (exposées via les propriétés created/updated).
+        # Pas de colonnes 'resultat' ni 'score_confiance' -> on construit la réponse
+        # avec les vrais attributs pour éviter toute erreur de validation (500).
         return [
             AnalyseResponse(
                 id=analyse.id,
+                plainte_id=analyse.plainte_id,
                 type_analyse=analyse.type_analyse,
-                resultat=getattr(analyse, "resultats", None),       # le modèle expose 'resultats'
-                score_confiance=getattr(analyse, "score_confiance", None),  # colonne inexistante -> None (plus de 500)
-                date_creation=analyse.date_creation,
+                parametres_entree=analyse.parametres_entree or {},
                 statut=analyse.statut,
-                plainte_id=analyse.plainte_id
+                resultats=analyse.resultats or {},
+                task_id=analyse.task_id,
+                duree_execution=analyse.duree_execution,
+                erreur_message=analyse.erreur_message,
+                analyste_id=analyse.analyste_id,
+                created=analyse.date_creation,
+                updated=analyse.date_modification,
             ) for analyse in analyses
         ]
 

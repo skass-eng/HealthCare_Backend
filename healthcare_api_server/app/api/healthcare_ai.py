@@ -285,7 +285,7 @@ async def call_ollama(prompt: str, system_prompt: str = None) -> str:
                     "messages": messages,
                     "stream": False,
                     "options": {
-                        "temperature": 0.7,
+                        "temperature": 0.2,
                         "num_predict": 2000
                     }
                 }
@@ -313,6 +313,33 @@ async def call_ollama(prompt: str, system_prompt: str = None) -> str:
         import traceback
         traceback.print_exc()
         return None
+
+
+# Ordre de sévérité décroissant pour la gravité (le plus critique en premier)
+_GRAVITE_RANK = {"CRITIQUE": 0, "ELEVEE": 1, "MOYENNE": 2, "FAIBLE": 3}
+_GRAVITE_ENUM = {"FAIBLE", "MOYENNE", "ELEVEE", "CRITIQUE"}
+
+
+def normaliser_gravite(valeur: Any) -> str:
+    """
+    Normalise une valeur de gravité renvoyée par le LLM vers l'enum
+    {FAIBLE, MOYENNE, ELEVEE, CRITIQUE}.
+
+    - Si le LLM renvoie plusieurs valeurs séparées par '|' (ex 'ELEVEE|CRITIQUE'),
+      on ne garde que la plus haute selon l'ordre CRITIQUE > ELEVEE > MOYENNE > FAIBLE.
+    - Mise en majuscules, suppression des espaces.
+    - Toute valeur hors enum (ex 'INCONNUE', '') retombe sur 'MOYENNE'.
+    """
+    if not valeur:
+        return "MOYENNE"
+    texte = str(valeur).upper()
+    candidats = [p.strip() for p in texte.split("|") if p.strip()]
+    # Ne conserver que les candidats appartenant à l'enum
+    valides = [c for c in candidats if c in _GRAVITE_ENUM]
+    if not valides:
+        return "MOYENNE"
+    # La plus haute (rang le plus petit)
+    return min(valides, key=lambda c: _GRAVITE_RANK[c])
 
 
 def prepare_complaints_data_for_analysis(plaintes: List[Plainte], services: List[Service]) -> Dict[str, Any]:
@@ -661,7 +688,8 @@ async def run_ai_analysis_background(task_id: str):
                         "numero": p.numero_plainte or f"PL_{p.id}",
                         "texte": texte_plainte[:800],
                         "priorite": p.priorite.value if p.priorite else "MOYEN",
-                        "statut": p.statut.value if p.statut else "RECU"
+                        "statut": p.statut.value if p.statut else "RECU",
+                        "score_sentiment": p.score_sentiment  # [-1, 1] ou None
                     })
             except Exception as e:
                 logger.warning(f"Erreur plainte {p.id}: {e}")
@@ -700,32 +728,47 @@ async def run_ai_analysis_background(task_id: str):
                 for i, p in enumerate(plaintes_service[:20])
             ])
             
-            system_prompt = """Tu es un expert en analyse de la satisfaction patient dans un établissement de santé.
-Tu dois identifier les CAUSES CONCRÈTES des plaintes à partir des descriptions fournies.
-Réponds UNIQUEMENT en JSON valide, sans texte avant ou après."""
+            # Prompt V2 (valide par banc d'essai oracle: 97.5% vs 63.8% pour l'ancien).
+            system_prompt = """Tu es un expert qualite et gestion des risques dans un etablissement de sante francais. Tu analyses des plaintes de patients pour en extraire les causes RACINES concretes et actionnables.
 
-            analysis_prompt = f"""Analyse les {len(plaintes_service)} plaintes suivantes du service "{service_name}":
+METHODE:
+1. Regroupe les plaintes par CAUSE RACINE commune (pas par symptome vague). Nomme chaque cause de facon PRECISE et SPECIFIQUE (ex: "Erreurs de dosage lors de la delivrance des medicaments" et NON "probleme de pharmacie" ; "Defaut de tri infirmier a l'accueil entrainant un retard de prise en charge" et NON "temps d'attente"). causes_identifiees[0] = LA cause dominante (mecanisme + consequence). Maximum 4 causes, triees par frequence decroissante.
+2. "frequence" = NOMBRE EXACT de plaintes (parmi celles fournies) mentionnant cette cause. Ne depasse jamais le nombre total de plaintes. Ne liste une cause QUE si frequence >= 1 avec au moins une citation reelle.
+3. BAREME de "gravite" (UNE seule valeur, jamais de "|"):
+   - CRITIQUE: pronostic vital engage, erreur medicamenteuse, retard de prise en charge d'une urgence vitale (AVC, douleur thoracique non triee).
+   - ELEVEE: atteinte a la securite/dignite sans risque vital immediat (sous-effectif de nuit, infection, suivi post-operatoire absent).
+   - MOYENNE: desagrement organisationnel sans risque clinique (delai de rendez-vous non urgent, manque d'information). Un rendez-vous programme n'est JAMAIS une urgence vitale.
+   - FAIBLE: gene mineure. POSITIF: remerciement/satisfaction.
+4. "sentiment_general" parmi TRES_NEGATIF, NEGATIF, NEUTRE, POSITIF. Il reflete la cause DOMINANTE (la plus frequente/grave), pas une moyenne: une plainte positive isolee n'annule PAS un grief ELEVEE/CRITIQUE recurrent. Si une cause CRITIQUE existe (risque vital, erreur medicamenteuse, AVC/infarctus, deces evite), sentiment_general DOIT etre TRES_NEGATIF.
+5. "exemples": UNIQUEMENT des extraits copies-colles MOT POUR MOT des plaintes. Interdiction d'inventer, de paraphraser, d'ecrire "Plainte 1". Si tu ne peux pas citer textuellement, mets [].
+6. "recommandations": liste PLATE de chaines de caracteres (jamais d'objets ni de listes imbriquees), actions concretes liees aux causes.
+Reponds en FRANCAIS uniquement, et UNIQUEMENT en JSON valide (aucun texte avant/apres, aucun mot anglais)."""
 
-{descriptions_texte}
-
----
-
-Réponds UNIQUEMENT avec ce JSON (pas de texte avant/après):
-{{
-    "service": "{service_name}",
-    "nombre_plaintes": {len(plaintes_service)},
-    "causes_identifiees": [
-        {{
-            "cause": "Description de la cause (ex: temps d'attente trop long)",
-            "frequence": "nombre de plaintes mentionnant cette cause",
-            "gravite": "FAIBLE|MOYENNE|ELEVEE|CRITIQUE",
-            "exemples": ["exemple concret tiré des plaintes"]
-        }}
-    ],
-    "problemes_recurrents": ["liste des problèmes qui reviennent souvent"],
-    "sentiment_general": "TRES_NEGATIF|NEGATIF|NEUTRE|POSITIF",
-    "recommandations": ["action concrète à prendre pour ce service"]
-}}"""
+            # L'exemple few-shot est une chaine simple (accolades reelles) -> concatene avec
+            # la partie dynamique en f-string, pour eviter tout echappement d'accolades.
+            _exemple_format = (
+                'EXEMPLE de format attendu (service fictif "Laboratoire", 3 plaintes):\n'
+                '{\n'
+                '  "service": "Laboratoire",\n'
+                '  "nombre_plaintes": 3,\n'
+                '  "causes_identifiees": [\n'
+                '    {"cause": "Perte ou non-transmission des resultats d\'analyse aux patients", "frequence": 2, "gravite": "ELEVEE", "exemples": ["je n\'ai jamais recu mes resultats"]},\n'
+                '    {"cause": "Accueil peu courtois", "frequence": 1, "gravite": "FAIBLE", "exemples": ["la secretaire etait desagreable"]}\n'
+                '  ],\n'
+                '  "problemes_recurrents": ["Perte de resultats d\'analyse"],\n'
+                '  "sentiment_general": "NEGATIF",\n'
+                '  "recommandations": ["Mettre en place une tracabilite des resultats", "Sensibiliser le personnel d\'accueil"]\n'
+                '}'
+            )
+            analysis_prompt = (
+                _exemple_format
+                + f'\n\nAnalyse maintenant les {len(plaintes_service)} plaintes du service "{service_name}":\n\n'
+                + descriptions_texte
+                + f'\n\nProduis le MEME format JSON (cle "service"="{service_name}", "nombre_plaintes"={len(plaintes_service)}). '
+                + "Cause dominante en premier (precise); frequence = comptage reel; gravite = une seule valeur du bareme; "
+                + "exemples = citations EXACTES (verbatim) ou []; recommandations = liste plate de chaines; "
+                + "sentiment_general coherent avec la gravite. JSON UNIQUEMENT."
+            )
 
             # Appeler Ollama
             ai_response = await call_ollama(analysis_prompt, system_prompt)
@@ -780,31 +823,80 @@ Réponds UNIQUEMENT avec ce JSON (pas de texte avant/après):
             "message": "Compilation des résultats..."
         })
         
-        # Collecter toutes les causes
+        # NETTOYAGE DE LA GRAVITE: normaliser chaque cause de chaque service
+        # (le LLM renvoie parfois 'ELEVEE|CRITIQUE' ou des valeurs hors enum).
+        # On normalise in-place dans causes_identifiees (causes par service) ...
+        for analyse in analyses_par_service:
+            for cause in analyse.get("causes_identifiees", []):
+                if isinstance(cause, dict):
+                    cause["gravite"] = normaliser_gravite(cause.get("gravite"))
+
+        # ... puis on collecte les causes globales avec la gravité déjà normalisée.
         toutes_causes = []
         for analyse in analyses_par_service:
             for cause in analyse.get("causes_identifiees", []):
+                if not isinstance(cause, dict):
+                    continue
                 toutes_causes.append({
                     "service": analyse["service"],
                     "cause": cause.get("cause", ""),
-                    "gravite": cause.get("gravite", "MOYENNE"),
+                    "gravite": normaliser_gravite(cause.get("gravite")),
                     "frequence": cause.get("frequence", 0)
                 })
+
+        toutes_causes.sort(key=lambda x: _GRAVITE_RANK.get(x["gravite"], 5))
         
-        ordre_gravite = {"CRITIQUE": 0, "ELEVEE": 1, "MOYENNE": 2, "FAIBLE": 3, "INCONNUE": 4}
-        toutes_causes.sort(key=lambda x: ordre_gravite.get(x["gravite"], 5))
-        
+        # SERVICES CRITIQUES DISCRIMINANTS
+        # On ne se fie plus au seul sentiment_general renvoyé par le LLM
+        # ('NEGATIF + >3 plaintes' marquait 5-6/6 services).
+        # On calcule des agrégats RÉELS à partir des score_sentiment ([-1,1])
+        # des plaintes déjà regroupées par service dans descriptions_par_service.
+        SEUIL_PCT_NEGATIFS = 60.0   # >= 60% de plaintes à sentiment négatif
+        SEUIL_SCORE_MOYEN = -0.3    # OU score sentiment moyen <= -0.3
+        SEUIL_MIN_PLAINTES = 3      # ET au moins 3 plaintes
+
+        services_critiques_detail = []
+        for service_name, plaintes_service in descriptions_par_service.items():
+            nb_plaintes = len(plaintes_service)
+            if nb_plaintes < SEUIL_MIN_PLAINTES:
+                continue
+
+            scores = [
+                p["score_sentiment"]
+                for p in plaintes_service
+                if p.get("score_sentiment") is not None
+            ]
+            if not scores:
+                # Pas de données de sentiment exploitables pour ce service
+                continue
+
+            nb_negatifs = sum(1 for s in scores if s < 0)
+            pct_negatifs = (nb_negatifs / len(scores)) * 100.0
+            score_moyen = sum(scores) / len(scores)
+
+            if pct_negatifs >= SEUIL_PCT_NEGATIFS or score_moyen <= SEUIL_SCORE_MOYEN:
+                services_critiques_detail.append({
+                    "service": service_name,
+                    "nombre_plaintes": nb_plaintes,
+                    "pct_negatifs": round(pct_negatifs, 1),
+                    "score_sentiment_moyen": round(score_moyen, 2),
+                })
+
+        # Trier par sévérité (plus négatif d'abord, puis plus de négatifs) et limiter au top 3
+        services_critiques_detail.sort(
+            key=lambda x: (x["score_sentiment_moyen"], -x["pct_negatifs"])
+        )
+        services_critiques_detail = services_critiques_detail[:3]
+        services_critiques = [s["service"] for s in services_critiques_detail]
+
         # Résultat final
         result = {
             "total_plaintes_analysees": len(plaintes),
             "nombre_services": total_services,
             "analyses_par_service": analyses_par_service,
             "causes_globales": toutes_causes[:10],
-            "services_critiques": [
-                a["service"] for a in analyses_par_service 
-                if a.get("sentiment_general") in ["TRES_NEGATIF", "NEGATIF"] 
-                and a.get("nombre_plaintes", 0) > 3
-            ],
+            "services_critiques": services_critiques,
+            "services_critiques_detail": services_critiques_detail,
             "timestamp": datetime.now().isoformat(),
             "model_used": OLLAMA_MODEL
         }

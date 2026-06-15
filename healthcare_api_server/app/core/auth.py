@@ -28,8 +28,16 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Vérifier un mot de passe"""
-    return pwd_context.verify(plain_password, hashed_password)
+    """Vérifier un mot de passe.
+
+    Retourne False (au lieu de lever) si le hash est NULL/malformé,
+    afin que le login renvoie un 401 propre plutôt qu'un 500.
+    """
+    try:
+        return pwd_context.verify(plain_password, hashed_password)
+    except Exception as e:
+        logger.warning(f"Echec verification mot de passe (hash invalide/manquant): {e}")
+        return False
 
 def get_password_hash(password: str) -> str:
     """Hacher un mot de passe"""
