@@ -1177,41 +1177,199 @@ def seed_ai_analysis_result(db, plaintes, services):
         if _sentiment_label(p.score_sentiment) == "negatif":
             negatifs_par_service[svc] = negatifs_par_service.get(svc, 0) + 1
 
-    analyses_par_service = [
-        {
+    # ------------------------------------------------------------------ #
+    # Catalogue de causes / problemes / recommandations par service.
+    # Permet de produire un schema EXACTEMENT conforme a ce que le
+    # renderer Ameliorations.tsx (onglet "Analyse IA Avancee") attend :
+    #   - analyses_par_service[].causes_identifiees[] = {cause, frequence,
+    #     gravite, exemples[]}
+    #   - analyses_par_service[].sentiment_general (TRES_NEGATIF / NEGATIF /
+    #     NEUTRE / POSITIF)
+    #   - analyses_par_service[].problemes_recurrents[] (string[])
+    #   - analyses_par_service[].recommandations[] (string[])
+    #   - causes_globales[] = {service, cause, gravite, frequence}
+    #   - services_critiques = string[] (noms de services)
+    # ------------------------------------------------------------------ #
+    catalogue_causes = {
+        "Urgences": {
+            "causes": [
+                ("Delais d'attente excessifs aux urgences", "CRITIQUE", [
+                    "J'ai attendu plus de 5 heures avant d'etre pris en charge.",
+                    "Aucune information sur le temps d'attente restant.",
+                ]),
+                ("Manque de communication sur la prise en charge", "ELEVEE", [
+                    "Personne ne m'a explique ce qui se passait.",
+                ]),
+                ("Conditions d'accueil et de confort insuffisantes", "MOYENNE", [
+                    "Salle d'attente bondee, aucune intimite.",
+                ]),
+            ],
+            "problemes": ["Delais d'attente", "Communication", "Surcharge du service"],
+            "recommandations": [
+                "Renforcer l'equipe de triage aux heures de pointe.",
+                "Afficher en temps reel les temps d'attente estimes.",
+                "Mettre en place un referent communication patient.",
+            ],
+        },
+        "Chirurgie": {
+            "causes": [
+                ("Report ou annulation d'interventions programmees", "CRITIQUE", [
+                    "Mon operation a ete annulee deux fois sans explication.",
+                ]),
+                ("Suivi post-operatoire insuffisant", "ELEVEE", [
+                    "Aucun suivi apres ma sortie, douleurs ignorees.",
+                ]),
+                ("Defaut d'information sur les risques", "MOYENNE", [
+                    "On ne m'a pas explique les suites de l'intervention.",
+                ]),
+            ],
+            "problemes": ["Annulations", "Suivi post-operatoire", "Information patient"],
+            "recommandations": [
+                "Securiser la planification du bloc operatoire.",
+                "Formaliser un protocole de suivi post-operatoire.",
+                "Remettre une fiche d'information avant chaque intervention.",
+            ],
+        },
+        "Cardiologie": {
+            "causes": [
+                ("Delais de rendez-vous trop longs", "ELEVEE", [
+                    "Plusieurs semaines d'attente pour une consultation.",
+                ]),
+                ("Resultats d'examens communiques tardivement", "MOYENNE", [
+                    "J'ai attendu 10 jours pour avoir mes resultats.",
+                ]),
+            ],
+            "problemes": ["Delais de rendez-vous", "Transmission des resultats"],
+            "recommandations": [
+                "Ouvrir des creneaux de consultation supplementaires.",
+                "Automatiser l'envoi securise des resultats d'examens.",
+            ],
+        },
+        "Pediatrie": {
+            "causes": [
+                ("Accueil des familles a ameliorer", "MOYENNE", [
+                    "Manque de disponibilite du personnel pour rassurer les parents.",
+                ]),
+                ("Coordination des soins perfectible", "MOYENNE", [
+                    "Plusieurs interlocuteurs, informations contradictoires.",
+                ]),
+            ],
+            "problemes": ["Accueil des familles", "Coordination"],
+            "recommandations": [
+                "Designer un soignant referent par enfant hospitalise.",
+                "Renforcer l'information aux familles.",
+            ],
+        },
+        "Radiologie": {
+            "causes": [
+                ("Delais d'attente pour les examens d'imagerie", "MOYENNE", [
+                    "Rendez-vous obtenu plusieurs semaines apres la prescription.",
+                ]),
+                ("Compte rendu d'examen tardif", "MOYENNE", [
+                    "Le compte rendu n'etait pas pret a la date prevue.",
+                ]),
+            ],
+            "problemes": ["Delais d'examen", "Comptes rendus"],
+            "recommandations": [
+                "Optimiser le planning des appareils d'imagerie.",
+                "Reduire le delai de redaction des comptes rendus.",
+            ],
+        },
+        "Administration / Qualite": {
+            "causes": [
+                ("Erreurs et lenteurs de facturation", "MOYENNE", [
+                    "Facture erronee, plusieurs relances necessaires.",
+                ]),
+                ("Difficultes d'acces aux documents administratifs", "BASSE", [
+                    "Demande de dossier medical restee sans reponse.",
+                ]),
+            ],
+            "problemes": ["Facturation", "Acces aux documents"],
+            "recommandations": [
+                "Fiabiliser le processus de facturation.",
+                "Mettre en place un guichet unique pour les demandes administratives.",
+            ],
+        },
+    }
+
+    def _sentiment_general(svc, nb, nb_neg):
+        """Libelle de sentiment global du service, format attendu par le front."""
+        if nb <= 0:
+            return "NEUTRE"
+        ratio = nb_neg / nb
+        if svc in SERVICES_CRITIQUES or ratio >= 0.55:
+            return "TRES_NEGATIF"
+        if ratio >= 0.35:
+            return "NEGATIF"
+        if ratio <= 0.15:
+            return "POSITIF"
+        return "NEUTRE"
+
+    # analyses_par_service : forme RICHE attendue par le renderer (cartes).
+    analyses_par_service = []
+    for svc, nb in sorted(par_service.items(),
+                          key=lambda kv: kv[1], reverse=True):
+        nb_neg = negatifs_par_service.get(svc, 0)
+        infos = catalogue_causes.get(svc, {
+            "causes": [
+                ("Insatisfaction generale signalee", "MOYENNE", [
+                    "Plaintes diverses concernant la prise en charge.",
+                ]),
+            ],
+            "problemes": ["Prise en charge"],
+            "recommandations": ["Analyser les retours patients du service."],
+        })
+        causes_identifiees = [
+            {
+                "cause": libelle,
+                "frequence": freq,
+                "gravite": gravite,
+                "exemples": exemples,
+            }
+            # frequence decroissante et plafonnee au nombre de negatifs
+            for idx, (libelle, gravite, exemples) in enumerate(infos["causes"])
+            for freq in (max(1, nb_neg - idx * 2),)
+        ]
+        analyses_par_service.append({
             "service": svc,
             "nombre_plaintes": nb,
-            "plaintes_negatives": negatifs_par_service.get(svc, 0),
-        }
-        for svc, nb in sorted(par_service.items(),
-                              key=lambda kv: kv[1], reverse=True)
-    ]
-
-    causes_globales = [
-        {"cause": "Delais d'attente et de prise en charge", "occurrences": 14},
-        {"cause": "Defaut de communication / d'information", "occurrences": 11},
-        {"cause": "Organisation et suivi des soins", "occurrences": 9},
-        {"cause": "Problemes administratifs et de facturation", "occurrences": 6},
-    ]
-
-    # Services critiques : ceux avec > 3 plaintes negatives (incluant
-    # explicitement Urgences et Chirurgie, biaises vers le negatif).
-    services_critiques = []
-    for svc in ("Urgences", "Chirurgie"):
-        services_critiques.append({
-            "service": svc,
-            "plaintes_negatives": negatifs_par_service.get(svc, 0),
-            "niveau": "critique",
+            "plaintes_negatives": nb_neg,
+            "sentiment_general": _sentiment_general(svc, nb, nb_neg),
+            "causes_identifiees": causes_identifiees,
+            "problemes_recurrents": list(infos["problemes"]),
+            "recommandations": list(infos["recommandations"]),
         })
-    for svc, nb_neg in negatifs_par_service.items():
-        if svc in ("Urgences", "Chirurgie"):
-            continue
-        if nb_neg > 3:
-            services_critiques.append({
-                "service": svc,
-                "plaintes_negatives": nb_neg,
-                "niveau": "a surveiller",
+
+    # causes_globales : Top causes "tous services", en OBJETS
+    # {service, cause, gravite, frequence} (forme exacte du tableau front).
+    causes_globales = []
+    for analyse in analyses_par_service:
+        for cause in analyse["causes_identifiees"]:
+            causes_globales.append({
+                "service": analyse["service"],
+                "cause": cause["cause"],
+                "gravite": cause["gravite"],
+                "frequence": cause["frequence"],
             })
+    # Tri par gravite puis frequence decroissante, limite au Top 10.
+    ordre_gravite = {"CRITIQUE": 0, "ELEVEE": 1, "MOYENNE": 2, "BASSE": 3}
+    causes_globales.sort(
+        key=lambda c: (ordre_gravite.get(c["gravite"], 9), -int(c["frequence"]))
+    )
+    causes_globales = causes_globales[:10]
+
+    # services_critiques : LISTE DE NOMS (string[]) attendue par le front.
+    # Inclut explicitement Urgences / Chirurgie + tout service au sentiment
+    # global tres negatif.
+    noms_critiques = []
+    for svc in ("Urgences", "Chirurgie"):
+        if svc in par_service and svc not in noms_critiques:
+            noms_critiques.append(svc)
+    for analyse in analyses_par_service:
+        if (analyse["sentiment_general"] == "TRES_NEGATIF"
+                and analyse["service"] not in noms_critiques):
+            noms_critiques.append(analyse["service"])
+    services_critiques = noms_critiques
 
     started = TODAY - timedelta(minutes=12)
     completed = TODAY - timedelta(minutes=10)
@@ -1233,7 +1391,7 @@ def seed_ai_analysis_result(db, plaintes, services):
     db.flush()
     print(f"    Resultat d'analyse globale cree "
           f"(total={total}, services={len(services)}, "
-          f"critiques={[s['service'] for s in services_critiques]}).")
+          f"critiques={services_critiques}).")
 
 
 # --------------------------------------------------------------------------- #

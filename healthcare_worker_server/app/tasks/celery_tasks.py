@@ -420,6 +420,50 @@ def generer_numero_plainte_unique(db, prefix: Optional[str] = None) -> str:
 
     return numero_plainte
 
+def _coerce_mots_cles(raw) -> list:
+    """Normalise `raw` en List[str] pour la colonne ARRAY(String) mots_cles_detectes.
+
+    Ollama peut renvoyer les mots-clés dans des formats divers (None, str, dict,
+    liste d'objets...). Un format inattendu ferait lever l'INSERT (exception avalée
+    par l'except global) -> aucune sauvegarde, statut bloqué à 'en_cours', polling
+    infini côté front. On normalise donc défensivement vers une liste de chaînes.
+    """
+    if raw is None:
+        return []
+    # Liste -> caster chaque élément en str (en ignorant les vides/None)
+    if isinstance(raw, list):
+        result = []
+        for x in raw:
+            if x is None:
+                continue
+            s = str(x).strip()
+            if s:
+                result.append(s)
+        return result
+    # Chaîne -> tenter un JSON liste, sinon split sur la virgule, sinon liste à 1 élément
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return []
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, (list, dict)):
+                return _coerce_mots_cles(parsed)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+        if "," in s:
+            return [part.strip() for part in s.split(",") if part.strip()]
+        return [s]
+    # Dict -> utiliser les valeurs (les mots-clés sont la donnée utile), repli sur les clés
+    if isinstance(raw, dict):
+        values = [str(v).strip() for v in raw.values() if v is not None and str(v).strip()]
+        if values:
+            return values
+        return [str(k).strip() for k in raw.keys() if str(k).strip()]
+    # Tout autre type -> repli sûr
+    return []
+
+
 def save_analysis_results(plainte_id: int, workflow_result: Dict[str, Any]):
     """Sauvegarde tous les résultats d'analyse dans la table analyses_ia - crée l'entrée si elle n'existe pas"""
     try:
@@ -488,7 +532,13 @@ def save_analysis_results(plainte_id: int, workflow_result: Dict[str, Any]):
                     mots_cles = sentiment_json.get("mots_cles_emotionnels", [])
             except (AttributeError, TypeError) as e:
                 logger.warning(f"⚠️ Extraction mots-clés impossible: {e}")
-            
+
+            # ROBUSTESSE: coercer en List[str] AVANT l'INSERT dans la colonne
+            # ARRAY(String). Un format inattendu (dict/None/str/liste d'objets)
+            # ferait échouer l'INSERT (exception avalée) et laisserait le statut
+            # bloqué à 'en_cours' -> polling infini côté front.
+            mots_cles = _coerce_mots_cles(mots_cles)
+
             # INSÉRER OU METTRE À JOUR l'entrée analyses_ia (crée si n'existe pas)
             session.execute(
                 text("""
@@ -535,6 +585,34 @@ def save_analysis_results(plainte_id: int, workflow_result: Dict[str, Any]):
             logger.info(f"✅ Résultats d'analyse sauvegardés pour plainte {plainte_id} (score_sentiment={score_sentiment:.3f})")
     except Exception as e:
         logger.error(f"Erreur lors de la sauvegarde des résultats: {str(e)}")
+        # NE PAS laisser le statut à 'en_cours' (sinon le front poll à l'infini).
+        # On force statut_analyse='erreur' (best-effort, session dédiée) puis on
+        # re-notifie le front pour qu'il arrête d'attendre. CONTRAT COMMUN:
+        # event 'ai_analysis_complete', data={plainte_id, statut, success}.
+        try:
+            with SessionLocal() as err_session:
+                err_session.execute(
+                    text("""
+                        INSERT INTO analyses_ia (plainte_id, statut_analyse, date_mise_a_jour)
+                        VALUES (:plainte_id, 'erreur', NOW())
+                        ON CONFLICT (plainte_id) DO UPDATE SET
+                            statut_analyse = 'erreur',
+                            date_mise_a_jour = NOW()
+                    """),
+                    {"plainte_id": plainte_id}
+                )
+                err_session.commit()
+                logger.info(f"🛑 statut_analyse='erreur' enregistré pour plainte {plainte_id}")
+        except Exception as e2:
+            logger.error(f"Impossible de marquer statut_analyse='erreur' pour plainte {plainte_id}: {e2}")
+        try:
+            notify_websocket("ai_analysis_complete", {
+                "plainte_id": plainte_id,
+                "statut": "erreur",
+                "success": False
+            })
+        except Exception as e3:
+            logger.warning(f"⚠️ Notification d'échec impossible pour plainte {plainte_id}: {e3}")
 
 def update_plainte_status(plainte_id: int, new_status: str):
     """Met à jour le statut d'une plainte - utilise les statuts valides de l'enum"""

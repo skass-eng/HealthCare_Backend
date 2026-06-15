@@ -63,7 +63,7 @@ class Settings(BaseSettings):
     # Configuration sécurité (comme ODYSSEE)
     SECRET_KEY: str = "your-secret-key-change-in-production"
     ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 480
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     
     # Configuration LLM (pour les analyses asynchrones)

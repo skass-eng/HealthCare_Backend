@@ -581,7 +581,12 @@ async def create_new_complaint(
     service_concerne_id: str = Form(...),
     utilisateur_assigne_id: str = Form(None),
     priorite: str = Form("MOYEN"),
-    
+
+    # Champs structurés optionnels (enrichissent l'analyse IA + la page détail)
+    circonstances: str = Form(None),
+    consequences: str = Form(None),
+    demande_plaignant: str = Form(None),
+
     # Documents optionnels
     documents: List[UploadFile] = File(None),
     
@@ -655,6 +660,9 @@ async def create_new_complaint(
             telephone_plaignant=telephone_plaignant,
             titre=objet,
             description=description,
+            circonstances=circonstances,
+            consequences=consequences,
+            demande_plaignant=demande_plaignant,
             date_incident=date_incident_parsed,
             service_id=service_id,
             assignee_a_id=user_id,
