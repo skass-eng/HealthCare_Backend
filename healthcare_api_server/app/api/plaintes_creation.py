@@ -2991,7 +2991,8 @@ async def create_plainte_from_archive_file(
                 source_archive=source_archive,
                 batch_id=batch_id,
                 processing_order=processing_order,
-                auto_assign_service=auto_assign_service
+                auto_assign_service=auto_assign_service,
+                cree_par_id=current_user.id  # C2: traçabilité du créateur jusque dans le worker
             )
             logger.info(f"🚀 [Archive Async] Tâche Celery lancée: {celery_task.id}")
             

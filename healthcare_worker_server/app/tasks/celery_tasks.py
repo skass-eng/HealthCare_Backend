@@ -394,6 +394,10 @@ def generer_numero_plainte_unique(db, prefix: Optional[str] = None) -> str:
     anti-boucle (max 100 tentatives) et un repli UUID. Centralise une logique qui
     était dupliquée entre les tâches d'archive (une copie n'avait aucune garde).
     """
+    # Plainte n'est importé qu'au niveau des tâches : on l'importe ici aussi car cette
+    # fonction est au niveau module (sinon NameError 'Plainte' à l'exécution).
+    from shared.models import Plainte
+
     if prefix is None:
         prefix = f"PL_{datetime.now().year}_"
 
@@ -1267,7 +1271,8 @@ def process_archive_file_async(
     source_archive: str,
     batch_id: str,
     processing_order: int,
-    auto_assign_service: bool = True
+    auto_assign_service: bool = True,
+    cree_par_id: int = None
 ):
     """
     Tâche asynchrone pour traiter un fichier d'archive et créer une plainte.
@@ -1508,29 +1513,39 @@ def process_archive_file_async(
                 prenom_plaignant=prenom_plaignant,
                 email_plaignant=email_plaignant,
                 telephone_plaignant=telephone_plaignant,
-                mode_reception="archive_import"
+                mode_reception="archive_import",
+                cree_par_id=cree_par_id  # C2: traçabilité du créateur (transmis depuis l'endpoint authentifié)
             )
-            
+
             db.add(new_plainte)
             db.flush()
-            
+
             # Copier le fichier vers le dossier documents
             if is_image:
                 docs_dir = Path("data/documents/images_originales")
             else:
                 docs_dir = Path("data/documents/pdf_originaux")
-            
+
             docs_dir.mkdir(parents=True, exist_ok=True)
-            
+
             safe_filename = filename.replace(" ", "_").replace("/", "_").replace("\\", "_")
             final_filename = f"{numero_plainte}_{safe_filename}"
             dest_path = docs_dir / final_filename
-            
+
             shutil.copy2(str(path), str(dest_path))
-            
+
+            # M11/cohérence: empreinte SHA-256 + type MIME, comme les autres voies de création
+            import hashlib, mimetypes
+            _h = hashlib.sha256()
+            with open(dest_path, "rb") as _f:
+                for _chunk in iter(lambda: _f.read(8192), b""):
+                    _h.update(_chunk)
+            file_hash = _h.hexdigest()
+            file_mime = mimetypes.guess_type(str(dest_path))[0] or ("application/pdf" if is_pdf else "image/jpeg")
+
             # Créer le document associé
             type_fichier = TypeFichier.PDF if is_pdf else TypeFichier.IMAGE
-            
+
             document = DocumentPlainte(
                 plainte_id=new_plainte.id,
                 nom_fichier=filename,
@@ -1538,6 +1553,8 @@ def process_archive_file_async(
                 chemin_fichier=str(dest_path),
                 type_fichier=type_fichier,
                 taille_fichier=path.stat().st_size,
+                hash_fichier=file_hash,  # M11
+                mime_type=file_mime,
                 est_piece_jointe_originale=True
             )
             
@@ -1694,6 +1711,7 @@ def process_archive_batch(
     
     auto_assign_service = options.get("auto_assign_service", True)
     continue_on_error = options.get("continue_on_error", True)
+    cree_par_id = options.get("cree_par_id")  # C2: traçabilité du créateur (transmis via options)
     
     logger.info(f"📦 [Batch {batch_id}] Démarrage traitement de {len(files_list)} fichiers")
     
@@ -1737,7 +1755,8 @@ def process_archive_batch(
                         filename=filename,
                         batch_id=batch_id,
                         processing_order=index + 1,
-                        auto_assign_service=auto_assign_service
+                        auto_assign_service=auto_assign_service,
+                        cree_par_id=cree_par_id
                     )
                     
                     if result.get("success"):
@@ -1834,7 +1853,8 @@ def process_single_archive_file(
     filename: str,
     batch_id: str,
     processing_order: int,
-    auto_assign_service: bool = True
+    auto_assign_service: bool = True,
+    cree_par_id: int = None
 ) -> dict:
     """
     Traite un seul fichier d'archive et crée la plainte correspondante.
@@ -2000,29 +2020,39 @@ def process_single_archive_file(
         prenom_plaignant=prenom_plaignant,
         email_plaignant=email_plaignant,
         telephone_plaignant=telephone_plaignant,
-        mode_reception="archive_import"
+        mode_reception="archive_import",
+        cree_par_id=cree_par_id  # C2: traçabilité du créateur
     )
-    
+
     db.add(new_plainte)
     db.flush()
-    
+
     # Copier le fichier vers le dossier documents
     if is_image:
         docs_dir = Path("data/documents/images_originales")
     else:
         docs_dir = Path("data/documents/pdf_originaux")
-    
+
     docs_dir.mkdir(parents=True, exist_ok=True)
-    
+
     safe_filename = filename.replace(" ", "_").replace("/", "_").replace("\\", "_")
     final_filename = f"{numero_plainte}_{safe_filename}"
     dest_path = docs_dir / final_filename
-    
+
     shutil.copy2(str(path), str(dest_path))
-    
+
+    # M11/cohérence: empreinte SHA-256 + type MIME
+    import hashlib, mimetypes
+    _h = hashlib.sha256()
+    with open(dest_path, "rb") as _f:
+        for _chunk in iter(lambda: _f.read(8192), b""):
+            _h.update(_chunk)
+    file_hash = _h.hexdigest()
+    file_mime = mimetypes.guess_type(str(dest_path))[0] or ("application/pdf" if is_pdf else "image/jpeg")
+
     # Créer le document associé
     type_fichier = TypeFichier.PDF if is_pdf else TypeFichier.IMAGE
-    
+
     document = DocumentPlainte(
         plainte_id=new_plainte.id,
         nom_fichier=filename,
@@ -2030,6 +2060,8 @@ def process_single_archive_file(
         chemin_fichier=str(dest_path),
         type_fichier=type_fichier,
         taille_fichier=path.stat().st_size,
+        hash_fichier=file_hash,  # M11
+        mime_type=file_mime,
         est_piece_jointe_originale=True
     )
     
