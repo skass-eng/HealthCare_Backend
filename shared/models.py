@@ -8,14 +8,17 @@ Version: 1.0.0 - Architecture ODYSSEE
 from sqlalchemy import (
     Boolean, Column, Integer, BigInteger, String, Text, Float, SmallInteger,
     DateTime, Date, ForeignKey, Index, CheckConstraint, func, Enum as SQLEnum,
-    JSON
+    JSON, event
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID, JSONB, ARRAY
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from uuid import uuid4
 import enum
+
+# Délai standard de réponse à une plainte (en jours) — aligné sur Organisation.configuration.
+DELAI_REPONSE_STANDARD_JOURS = 30
 
 Base = declarative_base()
 
@@ -277,7 +280,14 @@ class Plainte(Base):
     date_creation = Column(DateTime, nullable=False, default=datetime.utcnow, server_default=func.now())
     date_modification = Column(DateTime, onupdate=func.now())
     date_suppression = Column(DateTime)
-    
+
+    # Réponse officielle au plaignant + accusé de réception (cycle qualité)
+    reponse_redigee = Column(Text)                       # réponse officielle éditée par le responsable qualité
+    reponse_envoyee = Column(Boolean, default=False)
+    date_reponse_envoyee = Column(DateTime)
+    accuse_reception_envoye = Column(Boolean, default=False)
+    date_accuse_reception = Column(DateTime)
+
     # Relations simplifiées
     service = relationship("Service", back_populates="plaintes")
     createur = relationship("User", foreign_keys=[cree_par_id], back_populates="plaintes_creees")
@@ -297,10 +307,46 @@ class Plainte(Base):
     @property
     def created(self):
         return self.date_creation
-    
+
     @property
     def updated(self):
         return self.date_modification
+
+    @property
+    def est_en_retard(self) -> bool:
+        """True si le délai de réponse est dépassé et la plainte n'est pas clôturée."""
+        if self.date_limite_reponse is None:
+            return False
+        if self.statut in (StatutPlainte.TRAITE, StatutPlainte.CLOTURE):
+            return False
+        return self.date_limite_reponse < date.today()
+
+    @property
+    def jours_restants(self):
+        """Jours avant l'échéance (négatif si en retard), None si pas d'échéance."""
+        if self.date_limite_reponse is None:
+            return None
+        return (self.date_limite_reponse - date.today()).days
+
+
+# === Automatisations cycle de vie (centralisées pour TOUS les canaux de création/MAJ) ===
+@event.listens_for(Plainte, "before_insert")
+def _plainte_set_deadline(mapper, connection, target):
+    """Calcule automatiquement la date limite de réponse à la création."""
+    if target.date_limite_reponse is None:
+        base = target.date_creation or datetime.utcnow()
+        target.date_limite_reponse = (base + timedelta(days=DELAI_REPONSE_STANDARD_JOURS)).date()
+
+
+@event.listens_for(Plainte, "before_update")
+def _plainte_set_resolution(mapper, connection, target):
+    """Pose date_resolution à la clôture (TRAITE/CLOTURE), la retire en cas de réouverture."""
+    if target.statut in (StatutPlainte.TRAITE, StatutPlainte.CLOTURE):
+        if target.date_resolution is None:
+            target.date_resolution = datetime.utcnow()
+    elif target.statut in (StatutPlainte.RECU, StatutPlainte.EN_COURS):
+        target.date_resolution = None
+
 
 class Analyse(Base):
     """
@@ -428,6 +474,18 @@ class AnalyseIA(Base):
     
     # Relations
     plainte = relationship("Plainte", back_populates="analyse_ia")
+
+class NotePlainte(Base):
+    """Note d'instruction interne attachée à une plainte (investigation, échanges)."""
+    __tablename__ = "notes_plaintes"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    plainte_id = Column(BigInteger, ForeignKey("plaintes.id", ondelete="CASCADE"), nullable=False, index=True)
+    auteur_id = Column(Integer, ForeignKey("utilisateurs.id"))
+    contenu = Column(Text, nullable=False)
+    date_creation = Column(DateTime, server_default=func.now())
+
+    auteur = relationship("User")
 
 class AuditLog(Base):
     """
