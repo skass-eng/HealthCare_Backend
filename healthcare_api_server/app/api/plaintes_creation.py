@@ -2682,6 +2682,7 @@ async def create_complaint_from_image(
 
 @router.post("/depuis-temp")
 async def create_plainte_from_temp_file(
+    background_tasks: BackgroundTasks,
     temp_file_path: str = Form(..., description="Chemin du fichier temporaire sur le serveur"),
     file_type: str = Form(..., description="Type de fichier: 'pdf' ou 'image'"),
     service_id: int = Form(..., description="ID du service concerné"),
@@ -2859,7 +2860,13 @@ async def create_plainte_from_temp_file(
         db.refresh(new_plainte)
 
         logger.info(f"✅ Plainte {numero_plainte} créée depuis fichier temp")
-        
+
+        # Cohérence avec les autres voies de création (/nouvelle, /depuis-donnees-validees,
+        # /depuis-image/donnees-validees) : on déclenche l'analyse IA complète + la
+        # génération du PDF rapport. Sans ça, une plainte créée via ce chemin restait
+        # sans résumé, sans score, sans réponse IA et sans rapport PDF.
+        background_tasks.add_task(launch_background_analysis, new_plainte.id)
+
         return JSONResponse(content={
             "success": True,
             "message": f"Plainte {numero_plainte} créée avec succès",
@@ -2885,6 +2892,10 @@ async def create_plainte_from_temp_file(
                 "taille": len(content),
                 "chemin_stockage": str(file_path),
                 "type": file_type
+            },
+            "analyse_ia": {
+                "statut": "en_cours",
+                "message": "Analyse IA complète et génération du rapport PDF en cours"
             }
         })
         
