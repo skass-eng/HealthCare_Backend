@@ -3,6 +3,7 @@ Tâches Celery modulaires pour le traitement des plaintes
 Utilise l'architecture modulaire avec l'orchestrateur
 """
 import logging
+import math
 import os
 import sys
 import redis
@@ -122,8 +123,12 @@ def process_complaint_complete(self, plainte_id: int, document_path: Optional[st
     """
     logger.info(f"🚀 Démarrage du traitement complet - Plainte ID: {plainte_id}")
 
+    # task_id propagé dans CHAQUE payload (CONTRAT M12): permet à l'API de ré-émettre
+    # dans la room "task_{task_id}" en plus du broadcast, et au front de filtrer.
+    task_id = getattr(getattr(self, "request", None), "id", None)
+
     # 📡 Notifier le DEBUT de l'analyse IA (LIVE observable) - voir CONTRAT COMMUN
-    notify_websocket("ai_analysis_started", {"plainte_id": plainte_id})
+    notify_websocket("ai_analysis_started", {"plainte_id": plainte_id, "task_id": task_id})
 
     try:
         # Initialiser les services
@@ -134,12 +139,8 @@ def process_complaint_complete(self, plainte_id: int, document_path: Optional[st
         if not plainte_data:
             error_msg = f"Plainte {plainte_id} non trouvée en base de données"
             logger.error(error_msg)
-            # 📡 Notifier la fin (échec) pour ne pas laisser le front en attente
-            notify_websocket("ai_analysis_complete", {
-                "plainte_id": plainte_id,
-                "statut": "complete",
-                "success": False
-            })
+            # 📡 Notifier l'ÉCHEC pour ne pas laisser le front en attente (CONTRAT M15)
+            _notify_ai_failed(plainte_id, task_id, error_msg)
             return {"success": False, "error": error_msg}
 
         # Exécuter le workflow complet via l'orchestrateur
@@ -154,12 +155,20 @@ def process_complaint_complete(self, plainte_id: int, document_path: Optional[st
         logger.info(f"✅ Traitement complet terminé - Plainte ID: {plainte_id}")
 
         # 📡 Notifier la FIN de l'analyse IA (LIVE observable) - voir CONTRAT COMMUN
-        # Event type='ai_analysis_complete', data={plainte_id, statut:'complete', success}
-        notify_websocket("ai_analysis_complete", {
-            "plainte_id": plainte_id,
-            "statut": "complete",
-            "success": bool(workflow_result.get("success", False))
-        })
+        # Succès -> 'ai_analysis_complete' ; échec logique -> 'ai_analysis_failed' (M15).
+        success = bool(workflow_result.get("success", False))
+        if success:
+            notify_websocket("ai_analysis_complete", {
+                "plainte_id": plainte_id,
+                "task_id": task_id,
+                "statut": "complete",
+                "success": True
+            })
+        else:
+            _notify_ai_failed(
+                plainte_id, task_id,
+                workflow_result.get("error", "Échec de l'analyse IA")
+            )
 
         return workflow_result
 
@@ -167,12 +176,8 @@ def process_complaint_complete(self, plainte_id: int, document_path: Optional[st
         error_msg = f"Erreur lors du traitement complet: {str(e)}"
         logger.error(error_msg)
         update_plainte_status(plainte_id, "ERREUR_ANALYSE")
-        # 📡 Notifier la fin (échec) - voir CONTRAT COMMUN
-        notify_websocket("ai_analysis_complete", {
-            "plainte_id": plainte_id,
-            "statut": "complete",
-            "success": False
-        })
+        # 📡 Notifier l'ÉCHEC - voir CONTRAT COMMUN (M15)
+        _notify_ai_failed(plainte_id, task_id, error_msg)
         return {"success": False, "error": error_msg, "plainte_id": plainte_id}
 
 @app.task(bind=True, name="parse_document_only")
@@ -464,6 +469,68 @@ def _coerce_mots_cles(raw) -> list:
     return []
 
 
+def _marquer_analyse_erreur(plainte_id: int, message: str):
+    """Force statut_analyse='erreur' pour une plainte (best-effort, session dédiée).
+
+    Mutualise la logique du chemin nominal (~save_analysis_results) pour les autres
+    chemins (import archive — M8). Évite de laisser une plainte sans entrée
+    analyses_ia ni statut (chaîne de traitement non traçable, polling front infini).
+    Le message d'erreur est journalisé (pas de colonne dédiée dans le modèle).
+    """
+    try:
+        with SessionLocal() as err_session:
+            err_session.execute(
+                text("""
+                    INSERT INTO analyses_ia (plainte_id, statut_analyse, date_mise_a_jour)
+                    VALUES (:plainte_id, 'erreur', NOW())
+                    ON CONFLICT (plainte_id) DO UPDATE SET
+                        statut_analyse = 'erreur',
+                        date_mise_a_jour = NOW()
+                """),
+                {"plainte_id": plainte_id}
+            )
+            err_session.commit()
+            logger.info(f"🛑 statut_analyse='erreur' enregistré pour plainte {plainte_id}: {message}")
+    except Exception as e:
+        logger.error(f"Impossible de marquer statut_analyse='erreur' pour plainte {plainte_id}: {e}")
+
+
+def _detect_fallback(*sections) -> bool:
+    """Détecte une analyse SIMULÉE (fallback Ollama indisponible) — M7.
+
+    llm_provider injecte un marqueur `_fallback` (ou `_warning`) dans le JSON de
+    réponse quand le LLM n'a pas réellement produit l'analyse. On inspecte le
+    `content` de chaque section d'analyse (sentiment, summary, legal_response...)
+    et on retourne True dès qu'un marqueur est trouvé, afin de ne PAS confondre
+    une analyse simulée avec une vraie (intégrité audit/compliance).
+    """
+    def _content_has_marker(content) -> bool:
+        data = content
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return False
+        if isinstance(data, dict):
+            if data.get("_fallback") or data.get("_warning"):
+                return True
+        return False
+
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        # Marqueur directement sur la section (ex: legal_response)
+        if section.get("_fallback") or section.get("_warning"):
+            return True
+        if _content_has_marker(section.get("content")):
+            return True
+        # Sous-sections d'analyse (sentiment/summary/contacts...) avec leur propre content
+        for value in section.values():
+            if isinstance(value, dict) and _content_has_marker(value.get("content")):
+                return True
+    return False
+
+
 def save_analysis_results(plainte_id: int, workflow_result: Dict[str, Any]):
     """Sauvegarde tous les résultats d'analyse dans la table analyses_ia - crée l'entrée si elle n'existe pas"""
     try:
@@ -472,22 +539,40 @@ def save_analysis_results(plainte_id: int, workflow_result: Dict[str, Any]):
             analysis_results = workflow_result.get("analysis_results", {})
             legal_response = workflow_result.get("legal_response", {})
             
+            # Détecter une analyse SIMULÉE (fallback Ollama indisponible) — M7.
+            # llm_provider injecte un marqueur _fallback/_warning dans le JSON quand
+            # le LLM n'a pas réellement produit l'analyse. On ne doit PAS confondre
+            # une analyse simulée avec une vraie (audit/compliance).
+            est_fallback = _detect_fallback(analysis_results, legal_response)
+
             # Extraire le sentiment
             sentiment_data = analysis_results.get("sentiment", {})
             sentiment_content = sentiment_data.get("content", "{}")
             # Toujours initialiser sentiment_json: le bloc mots-clés plus bas l'utilise et
             # lèverait sinon un NameError (avalé par un except nu) quand le parsing échoue.
             sentiment_json: Dict[str, Any] = {}
+            # Origine du score (M6): 'llm' uniquement si le score vient RÉELLEMENT du
+            # LLM ; 'fallback' si l'analyse est simulée ; 'default' si valeur par défaut
+            # (parsing impossible, clé absente, NaN...).
+            score_sentiment_source = "default"
             try:
                 parsed_sentiment = json.loads(sentiment_content) if isinstance(sentiment_content, str) else sentiment_content
                 if isinstance(parsed_sentiment, dict):
                     sentiment_json = parsed_sentiment
                 sentiment = sentiment_json.get("sentiment_principal", "neutre")
-                score_sentiment = sentiment_json.get("score_sentiment", 0.5)
+                if "score_sentiment" in sentiment_json and sentiment_json.get("score_sentiment") is not None:
+                    score_sentiment = sentiment_json.get("score_sentiment")
+                    # Le score provient du contenu d'analyse: 'llm' si vraie analyse,
+                    # 'fallback' si analyse simulée Ollama.
+                    score_sentiment_source = "fallback" if est_fallback else "llm"
+                else:
+                    score_sentiment = 0.5
+                    score_sentiment_source = "default"
             except (json.JSONDecodeError, TypeError, ValueError) as e:
                 logger.warning(f"⚠️ Parsing sentiment impossible, valeurs par défaut: {e}")
                 sentiment = "neutre"
                 score_sentiment = 0.5
+                score_sentiment_source = "default"
 
             # Normaliser le score vers [-1, 1] (CONTRAT COMMUN: score_sentiment stocke en [-1,1])
             # Tolere les formats 0-1 ou 0-100 si l'IA renvoie une echelle differente.
@@ -495,6 +580,16 @@ def save_analysis_results(plainte_id: int, workflow_result: Dict[str, Any]):
                 score_sentiment = float(score_sentiment)
             except (TypeError, ValueError):
                 score_sentiment = 0.0
+                score_sentiment_source = "default"
+            # m6: rejeter NaN/inf AVANT l'insert (un NaN polluerait les agrégats KPI
+            # et lèverait potentiellement à l'insert/lecture). Repli sûr + log.
+            if math.isnan(score_sentiment) or math.isinf(score_sentiment):
+                logger.error(
+                    f"❌ score_sentiment invalide (NaN/inf) pour plainte {plainte_id}, "
+                    f"repli sur 0.0 (source=default)"
+                )
+                score_sentiment = 0.0
+                score_sentiment_source = "default"
             if score_sentiment > 1.0:
                 # Echelle 0-100 -> [-1,1] ; sinon (1, 100]) traitee comme 0-100
                 score_sentiment = (score_sentiment / 100.0) * 2.0 - 1.0
@@ -502,6 +597,14 @@ def save_analysis_results(plainte_id: int, workflow_result: Dict[str, Any]):
                 score_sentiment = -1.0
             # Clamp final de securite
             score_sentiment = max(-1.0, min(1.0, score_sentiment))
+
+            # M6: tracer en ERROR toute origine non-LLM (donnée non agrégeable telle quelle)
+            if score_sentiment_source != "llm":
+                logger.error(
+                    f"❌ score_sentiment NON issu du LLM pour plainte {plainte_id} "
+                    f"(source={score_sentiment_source}, est_fallback={est_fallback}, "
+                    f"valeur={score_sentiment:.3f}) — ne pas agréger comme satisfaction réelle"
+                )
 
             # Extraire le résumé
             summary_data = analysis_results.get("summary", {})
@@ -539,14 +642,23 @@ def save_analysis_results(plainte_id: int, workflow_result: Dict[str, Any]):
             # bloqué à 'en_cours' -> polling infini côté front.
             mots_cles = _coerce_mots_cles(mots_cles)
 
+            # Statut distinct pour une analyse SIMULÉE (M7): 'complete_fallback' ne doit
+            # PAS être confondu avec un vrai 'complete' issu du LLM.
+            if workflow_result.get("success"):
+                statut_analyse = "complete_fallback" if est_fallback else "complete"
+            else:
+                statut_analyse = "erreur"
+
             # INSÉRER OU METTRE À JOUR l'entrée analyses_ia (crée si n'existe pas)
             session.execute(
                 text("""
-                    INSERT INTO analyses_ia (plainte_id, sentiment, score_sentiment, confiance_sentiment, 
+                    INSERT INTO analyses_ia (plainte_id, sentiment, score_sentiment, confiance_sentiment,
                         service_suggere, resume_ia, reponse_suggeree, mots_cles_detectes, statut_analyse,
+                        est_fallback, score_sentiment_source,
                         date_analyse, date_mise_a_jour)
                     VALUES (:plainte_id, :sentiment, :score_sentiment, :confiance_sentiment,
                         :service_suggere, :resume_ia, :reponse_suggeree, :mots_cles_detectes, :statut_analyse,
+                        :est_fallback, :score_sentiment_source,
                         NOW(), NOW())
                     ON CONFLICT (plainte_id) DO UPDATE SET
                         sentiment = EXCLUDED.sentiment,
@@ -557,6 +669,8 @@ def save_analysis_results(plainte_id: int, workflow_result: Dict[str, Any]):
                         reponse_suggeree = EXCLUDED.reponse_suggeree,
                         mots_cles_detectes = EXCLUDED.mots_cles_detectes,
                         statut_analyse = EXCLUDED.statut_analyse,
+                        est_fallback = EXCLUDED.est_fallback,
+                        score_sentiment_source = EXCLUDED.score_sentiment_source,
                         date_analyse = NOW(),
                         date_mise_a_jour = NOW()
                 """),
@@ -569,7 +683,9 @@ def save_analysis_results(plainte_id: int, workflow_result: Dict[str, Any]):
                     "resume_ia": resume_ia,
                     "reponse_suggeree": reponse_suggeree,
                     "mots_cles_detectes": mots_cles,
-                    "statut_analyse": "complete" if workflow_result.get("success") else "erreur"
+                    "statut_analyse": statut_analyse,
+                    "est_fallback": est_fallback,
+                    "score_sentiment_source": score_sentiment_source
                 }
             )
 
@@ -586,33 +702,11 @@ def save_analysis_results(plainte_id: int, workflow_result: Dict[str, Any]):
     except Exception as e:
         logger.error(f"Erreur lors de la sauvegarde des résultats: {str(e)}")
         # NE PAS laisser le statut à 'en_cours' (sinon le front poll à l'infini).
-        # On force statut_analyse='erreur' (best-effort, session dédiée) puis on
-        # re-notifie le front pour qu'il arrête d'attendre. CONTRAT COMMUN:
-        # event 'ai_analysis_complete', data={plainte_id, statut, success}.
-        try:
-            with SessionLocal() as err_session:
-                err_session.execute(
-                    text("""
-                        INSERT INTO analyses_ia (plainte_id, statut_analyse, date_mise_a_jour)
-                        VALUES (:plainte_id, 'erreur', NOW())
-                        ON CONFLICT (plainte_id) DO UPDATE SET
-                            statut_analyse = 'erreur',
-                            date_mise_a_jour = NOW()
-                    """),
-                    {"plainte_id": plainte_id}
-                )
-                err_session.commit()
-                logger.info(f"🛑 statut_analyse='erreur' enregistré pour plainte {plainte_id}")
-        except Exception as e2:
-            logger.error(f"Impossible de marquer statut_analyse='erreur' pour plainte {plainte_id}: {e2}")
-        try:
-            notify_websocket("ai_analysis_complete", {
-                "plainte_id": plainte_id,
-                "statut": "erreur",
-                "success": False
-            })
-        except Exception as e3:
-            logger.warning(f"⚠️ Notification d'échec impossible pour plainte {plainte_id}: {e3}")
+        # On force statut_analyse='erreur' puis on notifie l'ÉCHEC (CONTRAT M15:
+        # event 'ai_analysis_failed', data={plainte_id, task_id, statut, success}).
+        # _notify_ai_failed enveloppe le publish (log CRITICAL si la notif échoue).
+        _marquer_analyse_erreur(plainte_id, f"Erreur sauvegarde résultats analyse: {e}")
+        _notify_ai_failed(plainte_id, None, str(e))
 
 def update_plainte_status(plainte_id: int, new_status: str):
     """Met à jour le statut d'une plainte - utilise les statuts valides de l'enum"""
@@ -674,7 +768,13 @@ def save_sentiment_analysis(plainte_id: int, sentiment_result):
                 sentiment = "neutre"
                 score_sentiment = 0.5
                 mots_cles = []
-            
+
+            # M9: coercer en List[str] AVANT l'INSERT dans la colonne ARRAY(String),
+            # comme dans save_analysis_results. Un format inattendu (dict/None/str/
+            # liste d'objets) ferait sinon échouer l'INSERT (exception avalée) et
+            # laisserait le statut bloqué à 'en_cours' -> polling infini côté front.
+            mots_cles = _coerce_mots_cles(mots_cles)
+
             session.execute(
                 text("""
                     INSERT INTO analyses_ia (plainte_id, sentiment, score_sentiment, confiance_sentiment, 
@@ -700,6 +800,24 @@ def save_sentiment_analysis(plainte_id: int, sentiment_result):
             logger.info(f"✅ Analyse de sentiment sauvegardée pour plainte {plainte_id}")
     except Exception as e:
         logger.error(f"Erreur lors de la sauvegarde de l'analyse de sentiment: {str(e)}")
+        # M9: ne PAS laisser le statut à 'en_cours' (polling infini côté front).
+        # On force statut_analyse='erreur' en best-effort sur une session dédiée.
+        try:
+            with SessionLocal() as err_session:
+                err_session.execute(
+                    text("""
+                        INSERT INTO analyses_ia (plainte_id, statut_analyse, date_mise_a_jour)
+                        VALUES (:plainte_id, 'erreur', NOW())
+                        ON CONFLICT (plainte_id) DO UPDATE SET
+                            statut_analyse = 'erreur',
+                            date_mise_a_jour = NOW()
+                    """),
+                    {"plainte_id": plainte_id}
+                )
+                err_session.commit()
+                logger.info(f"🛑 statut_analyse='erreur' enregistré pour plainte {plainte_id}")
+        except Exception as e2:
+            logger.error(f"Impossible de marquer statut_analyse='erreur' pour plainte {plainte_id}: {e2}")
 
 def save_summary_analysis(plainte_id: int, summary_result):
     """Sauvegarde le résumé dans la table analyses_ia - crée l'entrée si elle n'existe pas"""
@@ -903,6 +1021,30 @@ def notify_websocket(event_type: str, data: Dict[str, Any]):
         logger.info(f"📡 Notification WebSocket envoyée: {event_type}")
     except Exception as e:
         logger.warning(f"⚠️ Impossible d'envoyer la notification WebSocket: {e}")
+
+
+def _notify_ai_failed(plainte_id: int, task_id: Optional[str], error: str):
+    """Émet TOUJOURS 'ai_analysis_failed' (CONTRAT M15).
+
+    Le payload respecte le contrat minimal: {type, plainte_id, task_id, ...}.
+    Le publish est lui-même enveloppé dans un try/except: si la notification
+    d'échec échoue, on log en CRITICAL (un front bloqué "en cours" sans aucune
+    notif est le pire cas — il faut au moins une trace serveur exploitable).
+    """
+    try:
+        notify_websocket("ai_analysis_failed", {
+            "plainte_id": plainte_id,
+            "task_id": task_id,
+            "statut": "erreur",
+            "success": False,
+            "error": str(error)
+        })
+    except Exception as notif_error:
+        logger.critical(
+            f"🔥 CRITIQUE: notification 'ai_analysis_failed' impossible pour "
+            f"plainte {plainte_id} (task_id={task_id}): {notif_error} "
+            f"— erreur initiale: {error}"
+        )
 
 
 @app.task(bind=True, name="extract_pdf_data_async")
@@ -1430,10 +1572,29 @@ def process_archive_file_async(
                     
                     logger.info(f"✅ [Archive Task {task_id}] Analyse IA complète terminée pour plainte {new_plainte.id}")
                 else:
-                    logger.warning(f"⚠️ [Archive Task {task_id}] Données plainte non trouvées pour analyse IA")
-                    
+                    # M8: données introuvables -> écrire un statut d'erreur traçable
+                    # (pas de plainte sans entrée analyses_ia ni statut) + notifier le front.
+                    logger.error(f"❌ [Archive Task {task_id}] Données plainte non trouvées pour analyse IA")
+                    _marquer_analyse_erreur(
+                        new_plainte.id,
+                        f"Données plainte introuvables pour analyse IA (import archive, task {task_id})"
+                    )
+                    _notify_ai_failed(
+                        new_plainte.id, task_id,
+                        "Données plainte introuvables pour analyse IA"
+                    )
+
             except Exception as analysis_error:
-                logger.warning(f"⚠️ [Archive Task {task_id}] Erreur analyse IA (non bloquante): {analysis_error}")
+                # M8: en cas d'exception de l'analyse IA, ÉCRIRE un statut d'erreur
+                # (comme le chemin nominal save_analysis_results ~593-605) et notifier
+                # 'ai_analysis_failed' (CONTRAT M15). La plainte reste créée mais sa
+                # chaîne de traitement est désormais traçable (statut + message).
+                logger.error(f"❌ [Archive Task {task_id}] Erreur analyse IA: {analysis_error}")
+                _marquer_analyse_erreur(
+                    new_plainte.id,
+                    f"Erreur analyse IA (import archive, task {task_id}): {analysis_error}"
+                )
+                _notify_ai_failed(new_plainte.id, task_id, str(analysis_error))
             
             # Nettoyer le fichier temporaire
             try:

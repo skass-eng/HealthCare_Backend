@@ -56,6 +56,7 @@ class ComplaintWorkflowOrchestrator:
             "steps_completed": [],
             "steps_failed": [],
             "extracted_text": None,
+            "texte_analyse_utilise": None,
             "analysis_results": {},
             "legal_response": None,
             "pdf_report": None,
@@ -68,7 +69,26 @@ class ComplaintWorkflowOrchestrator:
             complaint_text = self._step_1_document_parsing(
                 plainte_data, document_path, workflow_result
             )
-            
+
+            # Conserver/exposer le texte reellement transmis au LLM (tracabilite)
+            workflow_result["texte_analyse_utilise"] = complaint_text
+
+            # GARDE-FOU: ne JAMAIS lancer le LLM sur un texte vide ou trop court.
+            # Sinon il hallucine une analyse a partir de (presque) rien, sans
+            # qu'aucune alerte ne soit levee. On exige un minimum de matiere.
+            if len(complaint_text.strip()) <= 50:
+                logger.error(
+                    "❌ Texte insuffisant pour analyse "
+                    f"({len(complaint_text.strip())} caracteres utiles) - "
+                    f"Plainte ID: {plainte_data.get('id', 'N/A')}. "
+                    "Analyse LLM non lancee."
+                )
+                workflow_result["errors"].append("texte insuffisant pour analyse")
+                workflow_result["end_time"] = datetime.now().isoformat()
+                workflow_result["success"] = False
+                workflow_result["error"] = "texte insuffisant pour analyse"
+                return workflow_result
+
             # ÉTAPE 2: Analyse complète de la plainte
             analysis_results = self._step_2_complete_analysis(
                 complaint_text, workflow_result
@@ -107,20 +127,17 @@ class ComplaintWorkflowOrchestrator:
         logger.info("📄 ÉTAPE 1: Parsing du document")
         
         # Construire le texte de base a partir des VRAIS champs de la plainte.
-        # NB: la colonne s'appelle 'description' (et non 'description_probleme',
-        # qui n'existe pas) -> sinon base_text vide -> le LLM analyse du vide et
-        # hallucine. On enrichit avec objet/circonstances/consequences/demande
-        # pour une analyse de meilleure qualite.
+        # NB: la colonne s'appelle 'description'. Les fallbacks vers
+        # 'description_probleme' / 'contenu' ont ete SUPPRIMES : ces colonnes
+        # n'existent pas -> elles renvoyaient toujours None et masquaient le fait
+        # que la description etait reellement vide (le LLM analysait alors du vide
+        # et hallucinait sans alerte). On enrichit avec
+        # objet/circonstances/consequences/demande pour une meilleure qualite.
         _parts = []
         _objet = plainte_data.get('titre') or plainte_data.get('objet')
         if _objet:
             _parts.append(f"Objet de la plainte : {_objet}")
-        _desc = (
-            plainte_data.get('description')
-            or plainte_data.get('description_probleme')
-            or plainte_data.get('contenu')
-            or ''
-        )
+        _desc = plainte_data.get('description') or ''
         if _desc:
             _parts.append(f"Description : {_desc}")
         for _key, _label in (

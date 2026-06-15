@@ -39,6 +39,20 @@ logger = logging.getLogger(__name__)
 # `data/documents` relativement au répertoire de travail du backend.
 REPERTOIRE_ARCHIVE_AUTORISE = Path("data/documents").resolve()
 
+# Champs de tri autorisés (finding m5). Auparavant un `sort_by` invalide était
+# silencieusement ignoré (fallback sur date_creation via getattr) : on renvoie
+# désormais une 400 explicite si le champ demandé n'est pas dans cette liste.
+ALLOWED_SORT_FIELDS = {
+    "date_creation",
+    "date_modification",
+    "date_limite_reponse",
+    "statut",
+    "priorite",
+    "service_id",
+    "numero_plainte",
+    "titre",
+}
+
 router = APIRouter(prefix="/plaintes", tags=["Plaintes - Gestion"])
 
 @router.get("/", response_model=PaginatedResponse[dict])
@@ -114,11 +128,18 @@ def get_plaintes(
             date_fin_inclusive = date_fin + timedelta(days=1)
             query = query.filter(Plainte.date_creation < date_fin_inclusive)
 
-        # Tri
+        # Tri (finding m5) : on valide le champ demandé contre une whitelist.
+        # Un champ inconnu n'est plus silencieusement ignoré mais rejeté en 400.
+        if sort_by not in ALLOWED_SORT_FIELDS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Champ de tri invalide: {sort_by}. Champs autorisés: {', '.join(sorted(ALLOWED_SORT_FIELDS))}"
+            )
+        sort_column = getattr(Plainte, sort_by)
         if sort_order.lower() == "desc":
-            query = query.order_by(desc(getattr(Plainte, sort_by, Plainte.date_creation)))
+            query = query.order_by(desc(sort_column))
         else:
-            query = query.order_by(getattr(Plainte, sort_by, Plainte.date_creation))
+            query = query.order_by(sort_column)
 
         # Pagination
         total = query.count()

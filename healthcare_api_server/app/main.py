@@ -31,54 +31,128 @@ logger = logging.getLogger(__name__)
 # Variables globales pour le listener Redis
 _redis_listener_task = None
 _redis_listener_started = False
+# Verrou protégeant le démarrage du listener (M16: évite la double-init concurrente)
+_redis_listener_lock = asyncio.Lock()
+
+# Backoff de reconnexion borné (C10): 1s -> 2s -> ... -> 30s max
+_REDIS_RECONNECT_BACKOFF_INITIAL = 1.0
+_REDIS_RECONNECT_BACKOFF_MAX = 30.0
+
+
+async def _emit_pubsub_message(sio_server, message):
+    """
+    Décode un message Redis et le ré-émet via Socket.IO.
+
+    CONTRAT WEBSOCKET (M12): broadcast à tous les clients ET, si le payload
+    contient un task_id, émission ciblée dans la room "task_{task_id}".
+    """
+    try:
+        data = json.loads(message['data'])
+        event_type = data.get('event')
+        event_data = data.get('data', {})
+
+        logger.info(f"📨 Message Redis reçu: {event_type}")
+
+        # Émettre à tous les clients Socket.IO (broadcast)
+        await sio_server.emit(event_type, event_data)
+
+        # Émettre aussi à la room spécifique de la tâche si task_id présent (M12)
+        task_id = event_data.get('task_id') if isinstance(event_data, dict) else None
+        if task_id:
+            await sio_server.emit(event_type, event_data, room=f'task_{task_id}')
+
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ Erreur parsing message Redis: {e}")
+    except Exception as e:
+        logger.error(f"❌ Erreur émission Socket.IO: {e}")
+
 
 # Listener Redis pour les notifications Celery -> Socket.IO
 async def redis_pubsub_listener(sio_server):
     """
     Écoute les notifications Redis du worker Celery
-    et les retransmet aux clients Socket.IO
+    et les retransmet aux clients Socket.IO.
+
+    C10: la boucle est protégée contre les pannes Redis. En cas d'erreur de
+    connexion/timeout, on ferme proprement la connexion (pas de fuite), on
+    applique un backoff exponentiel borné, puis on recrée la connexion et le
+    pubsub et on re-souscrit au canal. Sans ça, un redémarrage de Redis tuait
+    silencieusement la chaîne worker -> frontend.
     """
     import redis.asyncio as aioredis
-    
+    from redis.exceptions import RedisError
+
+    backoff = _REDIS_RECONNECT_BACKOFF_INITIAL
+
     while True:
+        redis_client = None
+        pubsub = None
         try:
             redis_client = aioredis.Redis(host='localhost', port=6379, db=0)
             pubsub = redis_client.pubsub()
             await pubsub.subscribe('websocket_notifications')
-            
+
             logger.info("📡 Redis PubSub listener démarré - Écoute du canal 'websocket_notifications'")
-            
+            # Connexion établie -> réinitialiser le backoff
+            backoff = _REDIS_RECONNECT_BACKOFF_INITIAL
+
             while True:
                 message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
                 if message is not None and message['type'] == 'message':
-                    try:
-                        data = json.loads(message['data'])
-                        event_type = data.get('event')
-                        event_data = data.get('data', {})
-                        
-                        logger.info(f"📨 Message Redis reçu: {event_type}")
-                        
-                        # Émettre à tous les clients Socket.IO
-                        await sio_server.emit(event_type, event_data)
-                        
-                        # Émettre aussi à la room spécifique de la tâche si task_id présent
-                        task_id = event_data.get('task_id')
-                        if task_id:
-                            await sio_server.emit(event_type, event_data, room=f'task_{task_id}')
-                            
-                    except json.JSONDecodeError as e:
-                        logger.error(f"❌ Erreur parsing message Redis: {e}")
-                    except Exception as e:
-                        logger.error(f"❌ Erreur émission Socket.IO: {e}")
-                        
+                    await _emit_pubsub_message(sio_server, message)
+
                 await asyncio.sleep(0.1)  # Petite pause pour ne pas surcharger
-                        
+
         except asyncio.CancelledError:
             logger.info("📡 Redis PubSub listener arrêté")
+            # Fermeture propre lors de l'arrêt applicatif (pas de fuite)
+            await _close_redis_resources(pubsub, redis_client)
             break
+        except (RedisError, ConnectionError, TimeoutError, OSError) as e:
+            # Panne Redis: fermer proprement, attendre (backoff borné), puis reconnecter
+            logger.error(
+                f"❌ Connexion Redis PubSub perdue: {e} "
+                f"- reconnexion dans {backoff:.0f}s"
+            )
+            await _close_redis_resources(pubsub, redis_client)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, _REDIS_RECONNECT_BACKOFF_MAX)
+            logger.info("🔄 Tentative de reconnexion au Redis PubSub...")
         except Exception as e:
-            logger.error(f"❌ Erreur Redis PubSub: {e}")
-            await asyncio.sleep(5)  # Réessayer après un délai
+            # Erreur inattendue: même stratégie de reconnexion bornée
+            logger.error(f"❌ Erreur Redis PubSub inattendue: {e}", exc_info=True)
+            await _close_redis_resources(pubsub, redis_client)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, _REDIS_RECONNECT_BACKOFF_MAX)
+
+
+async def _close_redis_resources(pubsub, redis_client):
+    """Ferme proprement le pubsub et la connexion Redis (évite les fuites). C10."""
+    if pubsub is not None:
+        try:
+            await pubsub.unsubscribe('websocket_notifications')
+        except Exception:
+            pass
+        try:
+            await pubsub.aclose()
+        except AttributeError:
+            # Compat anciennes versions de redis-py (close au lieu de aclose)
+            try:
+                await pubsub.close()
+            except Exception:
+                pass
+        except Exception:
+            pass
+    if redis_client is not None:
+        try:
+            await redis_client.aclose()
+        except AttributeError:
+            try:
+                await redis_client.close()
+            except Exception:
+                pass
+        except Exception:
+            pass
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -155,12 +229,17 @@ async def connect(sid, environ, auth=None):
     if auth and 'token' in auth:
         await sio.save_session(sid, {'token': auth['token']})
     await sio.emit('connected', {'message': 'Connexion établie', 'sid': sid}, to=sid)
-    
-    # Démarrer le listener Redis au premier connect (si pas déjà démarré)
+
+    # Démarrer le listener Redis au premier connect (si pas déjà démarré).
+    # M16: deux clients qui se connectent simultanément pouvaient lancer deux
+    # listeners (état global non verrouillé) -> events dupliqués. On protège
+    # par un asyncio.Lock() avec re-check du drapeau après acquisition.
     if not _redis_listener_started:
-        _redis_listener_started = True
-        _redis_listener_task = asyncio.create_task(redis_pubsub_listener(sio))
-        logger.info("🚀 Redis PubSub listener lancé")
+        async with _redis_listener_lock:
+            if not _redis_listener_started:
+                _redis_listener_started = True
+                _redis_listener_task = asyncio.create_task(redis_pubsub_listener(sio))
+                logger.info("🚀 Redis PubSub listener lancé")
 
 @sio.event
 async def disconnect(sid):

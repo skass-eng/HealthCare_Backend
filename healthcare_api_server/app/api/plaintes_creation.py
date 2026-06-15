@@ -400,11 +400,69 @@ async def launch_background_analysis(plainte_id: int):
         analyse_ia = db.query(AnalyseIA).filter(AnalyseIA.plainte_id == plainte_id).first()
         
         # 📄 TOUJOURS générer le PDF de manière synchrone (fiable)
+        # M3: le rapport PDF généré doit être tracé en base comme DocumentPlainte
+        #     (est_piece_jointe_originale=False) avec chemin/taille/mime/hash, afin
+        #     d'être re-téléchargeable depuis la base et non via le seul système
+        #     de fichiers.
+        # M4: en cas d'échec de génération, on log en ERROR (pas WARNING) et on
+        #     persiste un statut explicite — pas de succès trompeur silencieux.
         try:
             pdf_path = generate_pdf_synchrone(plainte_id, db)
             logger.info(f"📄 PDF généré avec succès: {pdf_path}")
+
+            # M3: enregistrement du rapport PDF comme DocumentPlainte.
+            # On met à jour l'enregistrement existant si le rapport a déjà été
+            # tracé (régénération) pour éviter les doublons.
+            try:
+                pdf_path_obj = Path(pdf_path)
+                taille_pdf = pdf_path_obj.stat().st_size if pdf_path_obj.exists() else None
+                doc_rapport = db.query(DocumentPlainte).filter(
+                    DocumentPlainte.plainte_id == plainte_id,
+                    DocumentPlainte.chemin_fichier == str(pdf_path_obj),
+                    DocumentPlainte.est_piece_jointe_originale == False  # noqa: E712
+                ).first()
+
+                if doc_rapport:
+                    doc_rapport.nom_fichier = pdf_path_obj.name
+                    doc_rapport.nom_stockage = pdf_path_obj.name
+                    doc_rapport.taille_fichier = taille_pdf
+                    doc_rapport.mime_type = "application/pdf"
+                    doc_rapport.hash_fichier = file_sha256(pdf_path_obj)
+                else:
+                    doc_rapport = DocumentPlainte(
+                        plainte_id=plainte_id,
+                        nom_fichier=pdf_path_obj.name,
+                        nom_stockage=pdf_path_obj.name,
+                        chemin_fichier=str(pdf_path_obj),
+                        type_fichier=TypeFichier.PDF,
+                        taille_fichier=taille_pdf,
+                        mime_type="application/pdf",
+                        hash_fichier=file_sha256(pdf_path_obj),  # M11: empreinte d'intégrité
+                        description="Rapport PDF généré automatiquement",
+                        est_piece_jointe_originale=False  # M3: rapport généré, pas une pièce source
+                    )
+                    db.add(doc_rapport)
+                db.commit()
+                logger.info(f"📄 Rapport PDF tracé en base (DocumentPlainte) pour plainte {plainte_id}")
+            except Exception as track_error:
+                # L'échec de traçabilité ne masque pas le succès de génération,
+                # mais doit être loggué en ERROR (rapport non tracé en base).
+                logger.error(
+                    f"❌ Échec d'enregistrement du rapport PDF en base pour plainte {plainte_id}: {track_error}"
+                )
+                db.rollback()
         except Exception as pdf_error:
-            logger.error(f"❌ Erreur génération PDF: {pdf_error}")
+            # M4: échec réel de génération du PDF — log ERROR (pas WARNING).
+            #     AnalyseIA ne possède pas de colonne dédiée pdf_status ; on marque
+            #     donc l'échec dans statut_analyse uniquement tant que l'analyse IA
+            #     n'a pas encore démarré, pour ne pas dissimuler l'erreur.
+            logger.error(f"❌ Erreur génération PDF pour plainte {plainte_id}: {pdf_error}")
+            if analyse_ia and analyse_ia.statut_analyse in (None, "en_attente"):
+                analyse_ia.statut_analyse = "pdf_echec"
+                try:
+                    db.commit()
+                except Exception:
+                    db.rollback()
         
         # Vérifier si Redis/Celery est disponible
         celery_available = False
@@ -479,7 +537,8 @@ async def launch_background_analysis(plainte_id: int):
                 analyse_ia.confiance_sentiment = 0.75
                 analyse_ia.score_priorite = 0.7
                 analyse_ia.resume_ia = f"Plainte analysée automatiquement. Sentiment {sentiment} détecté. Recommandation: {service_suggere}."
-                analyse_ia.mots_cles_detectes = json.dumps(["plainte", "service", "patient"])
+                # M22: colonne ARRAY(String) → liste Python, pas json.dumps(...)
+                analyse_ia.mots_cles_detectes = ["plainte", "service", "patient"]
                 analyse_ia.statut_analyse = "complete"
                 analyse_ia.date_analyse = datetime.now()
                 
@@ -650,14 +709,57 @@ async def create_new_complaint(
         if documents:
             upload_dir.mkdir(parents=True, exist_ok=True)
 
+            # M21: whitelist d'extensions/tailles (config), normalisée en minuscules.
+            allowed_extensions = {ext.lower() for ext in settings.ALLOWED_FILE_TYPES}
+            max_file_bytes = settings.MAX_FILE_SIZE_MB * 1024 * 1024
+
             for doc in documents:
                 if doc.filename:
+                    # M21: valider extension + mimetype + taille AVANT toute écriture
+                    #      disque ; rejet 422 sinon (aligné sur les endpoints qui
+                    #      valident déjà les uploads).
+                    file_ext = Path(doc.filename).suffix.lower()
+                    if file_ext not in allowed_extensions:
+                        raise HTTPException(
+                            status_code=422,
+                            detail=(
+                                f"Type de fichier non autorisé: '{doc.filename}'. "
+                                f"Extensions acceptées: {', '.join(sorted(allowed_extensions))}"
+                            )
+                        )
+
+                    content = await doc.read()
+                    if len(content) > max_file_bytes:
+                        raise HTTPException(
+                            status_code=422,
+                            detail=(
+                                f"Le fichier '{doc.filename}' dépasse la taille maximale "
+                                f"autorisée ({settings.MAX_FILE_SIZE_MB} Mo)."
+                            )
+                        )
+
+                    # M21: vérifier la cohérence du mimetype déclaré/déduit.
+                    mime_type = doc.content_type or mimetypes.guess_type(doc.filename)[0]
+                    expected_mime = mimetypes.guess_type(doc.filename)[0]
+                    if (
+                        mime_type
+                        and expected_mime
+                        and mime_type != expected_mime
+                        and not mime_type.startswith("application/octet-stream")
+                    ):
+                        raise HTTPException(
+                            status_code=422,
+                            detail=(
+                                f"Type MIME incohérent pour '{doc.filename}': "
+                                f"déclaré '{mime_type}', attendu '{expected_mime}'."
+                            )
+                        )
+
                     # C6: nom de stockage sécurisé (basename seul, anti path-traversal).
                     nom_stockage = safe_storage_name(numero_plainte, doc.filename)
                     file_path = (upload_dir / nom_stockage).resolve()
                     # C6: vérifier que le chemin final reste dans le périmètre autorisé.
                     assert_within(upload_dir, file_path)
-                    content = await doc.read()
 
                     with open(file_path, "wb") as buffer:
                         buffer.write(content)
@@ -669,7 +771,7 @@ async def create_new_complaint(
                         "nom_stockage": nom_stockage,
                         "chemin_fichier": str(file_path),  # M19: chemin absolu canonique
                         "taille_fichier": len(content),
-                        "mime_type": doc.content_type or mimetypes.guess_type(doc.filename)[0],
+                        "mime_type": mime_type,  # M21: mimetype validé ci-dessus
                         "type_fichier": get_type_fichier(doc.filename),
                         "hash_fichier": file_sha256(file_path)  # M11: empreinte d'intégrité
                     })
@@ -830,12 +932,15 @@ async def trigger_complaint_analysis(
         except Exception as e:
             logger.warning(f"Worker Celery non disponible pour plainte {plainte_id}: {e}")
             # Simuler une analyse simple si le worker n'est pas disponible
+            # M23: n'utiliser que les colonnes réelles d'AnalyseIA
+            #      (categorie_principale/score_urgence/resume_automatique/mots_cles
+            #      n'existent pas). mots_cles_detectes est un ARRAY → liste Python.
             if analyse_ia:
                 analyse_ia.sentiment = "neutre"
-                analyse_ia.categorie_principale = "generale"
-                analyse_ia.mots_cles = json.dumps(["plainte", "service"])
+                analyse_ia.mots_cles_detectes = ["plainte", "service"]
+                analyse_ia.resume_ia = "Analyse simulée (worker indisponible)."
                 analyse_ia.statut_analyse = "complete_simulation"
-                analyse_ia.date_modification = datetime.now()
+                analyse_ia.date_mise_a_jour = datetime.now()
                 db.commit()
         
         return {
@@ -864,17 +969,20 @@ def get_analysis_status(
         if not analyse_ia:
             raise HTTPException(status_code=404, detail="Analyse non trouvée")
         
+        # M23: n'exposer que les colonnes réelles d'AnalyseIA.
+        #      categorie_principale/score_urgence/resume_automatique/mots_cles/
+        #      recommandations/date_creation/date_modification n'existent pas et
+        #      provoquaient un AttributeError (GET 500).
         return {
             "plainte_id": str(plainte_id),
             "statut_analyse": analyse_ia.statut_analyse,
             "sentiment": analyse_ia.sentiment,
-            "categorie_principale": analyse_ia.categorie_principale,
-            "mots_cles": json.loads(analyse_ia.mots_cles) if analyse_ia.mots_cles else [],
-            "score_urgence": analyse_ia.score_urgence,
-            "resume_automatique": analyse_ia.resume_automatique,
-            "recommandations": json.loads(analyse_ia.recommandations) if analyse_ia.recommandations else [],
-            "date_creation": analyse_ia.date_creation.isoformat() if analyse_ia.date_creation else None,
-            "date_modification": analyse_ia.date_modification.isoformat() if analyse_ia.date_modification else None
+            "priorite_ia": analyse_ia.priorite_ia,
+            "service_suggere": analyse_ia.service_suggere,
+            "mots_cles_detectes": analyse_ia.mots_cles_detectes or [],
+            "resume_ia": analyse_ia.resume_ia,
+            "date_analyse": analyse_ia.date_analyse.isoformat() if analyse_ia.date_analyse else None,
+            "date_mise_a_jour": analyse_ia.date_mise_a_jour.isoformat() if analyse_ia.date_mise_a_jour else None
         }
         
     except HTTPException:
