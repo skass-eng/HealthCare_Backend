@@ -243,7 +243,7 @@ class Plainte(Base):
     
     # Références simplifiées
     service_id = Column(Integer, ForeignKey("services.id"), nullable=False)  # Service obligatoire maintenant
-    cree_par_id = Column(Integer, ForeignKey("utilisateurs.id"))
+    cree_par_id = Column(Integer, ForeignKey("utilisateurs.id", ondelete="SET NULL"))
     assignee_a_id = Column(Integer, ForeignKey("utilisateurs.id"))
     
     # Contenu principal
@@ -456,7 +456,13 @@ class AnalyseIA(Base):
     priorite_ia = Column(String(50))
     score_priorite = Column(Float)
     urgence_detectee = Column(Boolean, default=False)
-    
+
+    # Traçabilité de la source de l'analyse (findings M6/M7)
+    # est_fallback : True si l'analyse provient d'un fallback (LLM indisponible)
+    est_fallback = Column(Boolean, default=False, nullable=False)
+    # score_sentiment_source : origine du score de sentiment — 'llm', 'fallback' ou 'default'
+    score_sentiment_source = Column(String(50), nullable=True)
+
     # Résumé et réponse IA
     resume_ia = Column(Text)
     reponse_suggeree = Column(Text)
@@ -540,6 +546,7 @@ class DocumentPlainte(Base):
     type_fichier = Column(SQLEnum(TypeFichier), default=TypeFichier.AUTRE)
     taille_fichier = Column(BigInteger)  # Taille en octets
     mime_type = Column(String(100))
+    hash_fichier = Column(String, nullable=True)  # Empreinte du fichier pour déduplication/intégrité (finding M11)
     
     # Métadonnées
     description = Column(Text)

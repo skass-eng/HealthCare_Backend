@@ -18,18 +18,26 @@ from pathlib import Path
 import os
 
 from ..db.database import get_db
-from shared.models import Plainte, User, Service, Analyse, StatutPlainte, DocumentPlainte, AnalyseIA, NotePlainte
+from shared.models import Plainte, User, UserRole, Service, Analyse, StatutPlainte, DocumentPlainte, AnalyseIA, NotePlainte
 from shared.schemas import (
     PlainteCreate, PlainteUpdate, PlainteResponse,
     AnalyseTaskRequest, TaskStatus, PaginatedResponse, AnalyseResponse, DocumentPlainteResponse
 )
-from ..core.auth import get_current_user  # protège uniquement le DELETE (cf. delete_plainte)
+# Authentification et contrôle de rôle : get_current_user et require_role
+# sont définis dans core/auth.py — on les importe, on ne les réécrit pas.
+from ..core.auth import get_current_user, require_role
+from ..core.storage import assert_within, file_sha256
 from ..services.task_manager import trigger_analyse_plainte
 from ..services.audit import log_audit, get_historique
 from ..services.notifications import send_email_safe
 from ..core.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Répertoire d'archive autorisé pour le téléchargement de documents (anti
+# path-traversal, finding C6). Tous les documents sont stockés sous
+# `data/documents` relativement au répertoire de travail du backend.
+REPERTOIRE_ARCHIVE_AUTORISE = Path("data/documents").resolve()
 
 router = APIRouter(prefix="/plaintes", tags=["Plaintes - Gestion"])
 
@@ -53,11 +61,12 @@ def get_plaintes(
     """
     try:
         # Construction de la requête de base
+        # On exclut systématiquement les plaintes soft-deletées (date_suppression non nul, finding C5).
         query = db.query(Plainte).options(
             selectinload(Plainte.service),
             selectinload(Plainte.assigned_user),
             selectinload(Plainte.analyses)
-        )
+        ).filter(Plainte.date_suppression.is_(None))
 
         # Application des filtres
         if statut:
@@ -176,10 +185,11 @@ async def export_plaintes(
     """
     try:
         # Construction de la requête avec filtres
+        # Les plaintes soft-deletées sont exclues de l'export (finding C5).
         query = db.query(Plainte).options(
             selectinload(Plainte.service),
             selectinload(Plainte.assigned_user)
-        )
+        ).filter(Plainte.date_suppression.is_(None))
 
         if statut:
             try:
@@ -284,7 +294,11 @@ async def export_plaintes(
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/{plainte_id}")
-def get_plainte(plainte_id: int, db: Session = Depends(get_db)):
+def get_plainte(
+    plainte_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """
     Récupérer une plainte spécifique par son ID avec tous les documents et l'analyse IA
     """
@@ -420,7 +434,11 @@ def get_plainte(plainte_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/{plainte_id}/documents")
-def get_plainte_documents(plainte_id: int, db: Session = Depends(get_db)):
+def get_plainte_documents(
+    plainte_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """
     Récupérer tous les documents d'une plainte spécifique
     """
@@ -495,7 +513,12 @@ def get_plainte_documents(plainte_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/{plainte_id}/documents/{document_id}/download")
-def download_document(plainte_id: int, document_id: int, db: Session = Depends(get_db)):
+def download_document(
+    plainte_id: int,
+    document_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """
     Télécharger un document spécifique d'une plainte
     """
@@ -508,8 +531,26 @@ def download_document(plainte_id: int, document_id: int, db: Session = Depends(g
         if not document:
             raise HTTPException(status_code=404, detail="Document non trouvé")
 
-        if not os.path.exists(document.chemin_fichier):
+        # m4 : on s'assure que le chemin est renseigné avant tout accès disque.
+        if not document.chemin_fichier or not os.path.exists(document.chemin_fichier):
             raise HTTPException(status_code=404, detail="Fichier non trouvé sur le serveur")
+
+        # C6 : on vérifie que le fichier demandé reste bien dans le répertoire
+        # d'archive autorisé (anti path-traversal) avant de le servir.
+        assert_within(REPERTOIRE_ARCHIVE_AUTORISE, document.chemin_fichier)
+
+        # M11 : si une empreinte a été enregistrée à l'upload, on recalcule le
+        # SHA-256 du fichier sur disque et on rejette tout fichier dont
+        # l'intégrité a été compromise (corruption/altération).
+        if document.hash_fichier:
+            hash_actuel = file_sha256(document.chemin_fichier)
+            if hash_actuel != document.hash_fichier:
+                logger.error(
+                    "❌ Intégrité fichier compromise pour le document %s "
+                    "(plainte %s): hash attendu=%s, hash calculé=%s",
+                    document_id, plainte_id, document.hash_fichier, hash_actuel,
+                )
+                raise HTTPException(status_code=500, detail="integrite fichier compromise")
 
         return FileResponse(
             path=document.chemin_fichier,
@@ -524,7 +565,11 @@ def download_document(plainte_id: int, document_id: int, db: Session = Depends(g
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/{plainte_id}/pdf-rapport/download")
-def download_pdf_rapport(plainte_id: int, db: Session = Depends(get_db)):
+def download_pdf_rapport(
+    plainte_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """
     Télécharger le PDF rapport généré pour une plainte
     """
@@ -573,7 +618,10 @@ def download_pdf_rapport(plainte_id: int, db: Session = Depends(get_db)):
 async def update_plainte(
     plainte_id: int,
     plainte_data: PlainteUpdate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(
+        require_role([UserRole.RESPONSABLE_QUALITE, UserRole.ADMIN])
+    ),
 ):
     """
     Mettre à jour une plainte existante
@@ -606,15 +654,15 @@ async def update_plainte(
         # Traçabilité : une entrée d'audit par changement significatif
         nouveau_statut = plainte.statut.value if plainte.statut else None
         if nouveau_statut != ancien_statut:
-            log_audit(db, "changement_statut", "plainte", plainte_id,
+            log_audit(db, "changement_statut", "plainte", plainte_id, user_id=current_user.id,
                       donnees_avant={"statut": ancien_statut}, donnees_apres={"statut": nouveau_statut})
         if plainte.assignee_a_id != ancien_assignee:
-            log_audit(db, "reaffectation", "plainte", plainte_id,
+            log_audit(db, "reaffectation", "plainte", plainte_id, user_id=current_user.id,
                       donnees_avant={"assignee_a_id": ancien_assignee},
                       donnees_apres={"assignee_a_id": plainte.assignee_a_id})
         nouvelle_priorite = plainte.priorite.value if plainte.priorite else None
         if nouvelle_priorite != ancienne_priorite:
-            log_audit(db, "changement_priorite", "plainte", plainte_id,
+            log_audit(db, "changement_priorite", "plainte", plainte_id, user_id=current_user.id,
                       donnees_avant={"priorite": ancienne_priorite}, donnees_apres={"priorite": nouvelle_priorite})
         db.commit()
 
@@ -624,6 +672,11 @@ async def update_plainte(
             selectinload(Plainte.assigned_user),
             selectinload(Plainte.analyses)
         ).filter(Plainte.id == plainte_id).first()
+
+        # M25 : si la plainte a disparu entre le commit et la re-requête, on
+        # échoue proprement avant d'accéder à ses relations (évite un 500 opaque).
+        if not plainte_updated:
+            raise HTTPException(status_code=500, detail="Plainte introuvable après mise à jour")
 
         logger.info(f"✅ Plainte mise à jour: ID={plainte_id}")
 
@@ -669,7 +722,14 @@ async def get_plainte_historique(plainte_id: int, db: Session = Depends(get_db))
 
 
 @router.put("/{plainte_id}/reponse")
-async def save_reponse(plainte_id: int, contenu: str = Body(..., embed=True), db: Session = Depends(get_db)):
+async def save_reponse(
+    plainte_id: int,
+    contenu: str = Body(..., embed=True),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(
+        require_role([UserRole.RESPONSABLE_QUALITE, UserRole.ADMIN])
+    ),
+):
     """Sauvegarder (brouillon) la réponse officielle rédigée par le responsable qualité."""
     plainte = db.query(Plainte).filter(Plainte.id == plainte_id).first()
     if not plainte:
@@ -677,13 +737,20 @@ async def save_reponse(plainte_id: int, contenu: str = Body(..., embed=True), db
     plainte.reponse_redigee = contenu
     plainte.date_modification = datetime.now()
     db.commit()
-    log_audit(db, "reponse_redigee", "plainte", plainte_id, details={"longueur": len(contenu or "")})
+    log_audit(db, "reponse_redigee", "plainte", plainte_id, user_id=current_user.id,
+              details={"longueur": len(contenu or "")})
     db.commit()
     return {"plainte_id": plainte_id, "reponse_redigee": plainte.reponse_redigee, "message": "Réponse enregistrée"}
 
 
 @router.post("/{plainte_id}/reponse/envoyer")
-async def envoyer_reponse(plainte_id: int, db: Session = Depends(get_db)):
+async def envoyer_reponse(
+    plainte_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(
+        require_role([UserRole.RESPONSABLE_QUALITE, UserRole.ADMIN])
+    ),
+):
     """Marquer la réponse officielle comme envoyée (email si SMTP configuré, sinon enregistrée)."""
     plainte = db.query(Plainte).filter(Plainte.id == plainte_id).first()
     if not plainte:
@@ -697,7 +764,7 @@ async def envoyer_reponse(plainte_id: int, db: Session = Depends(get_db)):
     plainte.reponse_envoyee = True
     plainte.date_reponse_envoyee = datetime.now()
     db.commit()
-    log_audit(db, "reponse_envoyee", "plainte", plainte_id,
+    log_audit(db, "reponse_envoyee", "plainte", plainte_id, user_id=current_user.id,
               details={"email": plainte.email_plaignant, "email_reel_envoye": envoye})
     db.commit()
     return {"plainte_id": plainte_id, "reponse_envoyee": True,
@@ -731,13 +798,19 @@ async def envoyer_accuse_reception(plainte_id: int, db: Session = Depends(get_db
 
 
 @router.get("/{plainte_id}/notes")
-async def list_notes(plainte_id: int, db: Session = Depends(get_db)):
+async def list_notes(
+    plainte_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Lister les notes d'instruction d'une plainte (plus récentes d'abord)."""
     plainte = db.query(Plainte).filter(Plainte.id == plainte_id).first()
     if not plainte:
         raise HTTPException(status_code=404, detail="Plainte non trouvée")
+    # M17 : on précharge l'auteur de chaque note pour éviter le N+1.
     notes = (
         db.query(NotePlainte)
+        .options(selectinload(NotePlainte.auteur))
         .filter(NotePlainte.plainte_id == plainte_id)
         .order_by(NotePlainte.date_creation.desc())
         .all()
@@ -758,19 +831,26 @@ async def list_notes(plainte_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/{plainte_id}/notes")
-async def add_note(plainte_id: int, contenu: str = Body(..., embed=True),
-                   auteur_id: Optional[int] = Body(None, embed=True), db: Session = Depends(get_db)):
+async def add_note(
+    plainte_id: int,
+    contenu: str = Body(..., embed=True),
+    auteur_id: Optional[int] = Body(None, embed=True),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Ajouter une note d'instruction interne à une plainte."""
     plainte = db.query(Plainte).filter(Plainte.id == plainte_id).first()
     if not plainte:
         raise HTTPException(status_code=404, detail="Plainte non trouvée")
     if not (contenu or "").strip():
         raise HTTPException(status_code=400, detail="Le contenu de la note est requis")
-    note = NotePlainte(plainte_id=plainte_id, contenu=contenu, auteur_id=auteur_id)
+    # M2 : on ignore tout auteur_id fourni par le client et on force l'auteur
+    # à l'utilisateur authentifié (anti-falsification de la traçabilité).
+    note = NotePlainte(plainte_id=plainte_id, contenu=contenu, auteur_id=current_user.id)
     db.add(note)
     db.commit()
     db.refresh(note)
-    log_audit(db, "note_ajoutee", "plainte", plainte_id, user_id=auteur_id, details={"note_id": note.id})
+    log_audit(db, "note_ajoutee", "plainte", plainte_id, user_id=current_user.id, details={"note_id": note.id})
     db.commit()
     return {
         "id": note.id,
@@ -785,21 +865,34 @@ async def add_note(plainte_id: int, contenu: str = Body(..., embed=True),
 async def delete_plainte(
     plainte_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role([UserRole.ADMIN])),
 ):
     """
-    Supprimer une plainte (authentification requise — le front attache le token Bearer).
+    Supprimer une plainte (réservé aux administrateurs — le front attache le token Bearer).
+
+    C5 : suppression logique (soft-delete) — on horodate `date_suppression`
+    au lieu d'un `db.delete()` destructif. La plainte et ses documents disque
+    sont conservés (traçabilité/archive), mais exclus des listes/exports.
     """
     try:
-        plainte = db.query(Plainte).filter(Plainte.id == plainte_id).first()
-        
+        plainte = (
+            db.query(Plainte)
+            .filter(Plainte.id == plainte_id, Plainte.date_suppression.is_(None))
+            .first()
+        )
+
         if not plainte:
             raise HTTPException(status_code=404, detail="Plainte non trouvée")
 
-        db.delete(plainte)
+        # Audit AVANT la suppression logique (on trace l'auteur de l'action).
+        log_audit(db, "suppression_plainte", "plainte", plainte_id, user_id=current_user.id,
+                  details={"numero_plainte": plainte.numero_plainte})
+
+        # Soft-delete : on n'efface ni la ligne en base ni les fichiers disque.
+        plainte.date_suppression = datetime.utcnow()
         db.commit()
 
-        logger.info(f"✅ Plainte supprimée: ID={plainte_id}")
+        logger.info(f"✅ Plainte supprimée (soft-delete): ID={plainte_id}")
         return {"message": "Plainte supprimée avec succès"}
 
     except HTTPException:

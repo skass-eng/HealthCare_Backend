@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     VERSION: str = "1.0.0"
     DEBUG: bool = False
     ENVIRONMENT: str = "development"
+    # Mode developpement / demo.
+    # IMPORTANT : default True pour NE PAS casser le dev local actuel ni la demo.
+    # Le garde-fou SECRET_KEY (RuntimeError) ne se declenche QU'EN DEV_MODE=False (= prod).
+    # En prod, exporter DEV_MODE=False pour activer la verification stricte.
+    DEV_MODE: bool = True
     
     # Configuration du serveur API
     API_HOST: str = "0.0.0.0"
@@ -120,13 +125,35 @@ def get_settings() -> Settings:
 # Instance globale
 settings = get_settings()
 
-# Avertissement clair au boot si la SECRET_KEY reste le placeholder public.
-# (On NE fait PAS crasher l'app pour ne pas casser la démo.)
+# Garde-fou SECRET_KEY au boot (Finding C1).
+#
+# Comportement :
+#   - En DEV / demo (DEV_MODE=True, valeur par defaut, OU DEBUG=True) :
+#     on NE fait PAS crasher l'app afin de ne pas casser le dev local ni la demo.
+#     On se contente d'un avertissement clair.
+#   - En PROD (DEV_MODE=False et DEBUG=False) :
+#     si SECRET_KEY est restee la valeur placeholder publique, on LEVE une
+#     RuntimeError pour empecher tout demarrage avec une cle non securisee.
+#
+# Pour passer en mode strict (prod) : exporter DEV_MODE=False.
+# Pour generer une cle robuste : openssl rand -hex 32
+_dev_permissif = settings.DEV_MODE or settings.DEBUG
 if settings.SECRET_KEY == _SECRET_KEY_PLACEHOLDER:
-    logger.warning(
-        "SECRET_KEY utilise la valeur placeholder publique par defaut. "
-        "Definissez la variable d'environnement SECRET_KEY avant tout deploiement reel."
-    )
+    if _dev_permissif:
+        logger.warning(
+            "SECRET_KEY utilise la valeur placeholder publique par defaut. "
+            "Acceptee car DEV_MODE/DEBUG est actif. "
+            "Definissez la variable d'environnement SECRET_KEY avant tout deploiement reel."
+        )
+    else:
+        raise RuntimeError(
+            "SECRET_KEY utilise la valeur placeholder publique par defaut, ce qui est "
+            "interdit hors mode developpement (DEV_MODE=False). "
+            "Exportez une cle secrete robuste avant le demarrage, par exemple :\n"
+            "    export SECRET_KEY=$(openssl rand -hex 32)\n"
+            "(ou definissez SECRET_KEY dans le fichier .env). "
+            "Pour autoriser temporairement le placeholder en dev, mettez DEV_MODE=True."
+        )
 
 # Configuration pour différents environnements
 def get_database_url() -> str:

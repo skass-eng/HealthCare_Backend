@@ -33,7 +33,8 @@ from shared.schemas import (
     PlainteCreate, PlainteUpdate, PlainteResponse,
     AnalyseTaskRequest, TaskStatus, PaginatedResponse, AnalyseResponse
 )
-# from ..core.auth import get_current_user  # Désactivé pour le développement
+from ..core.auth import get_current_user  # C2: authentification réactivée sur la création
+from ..core.storage import safe_storage_name, assert_within, cleanup_files, file_sha256  # C6/C7/M11/M19
 from ..services.task_manager import trigger_analyse_plainte
 # from ..services.worker_tasks import trigger_analyse_plainte_complete  # Ancien système simulé
 from celery_worker_v2 import trigger_plainte_analysis  # Système Celery v2
@@ -386,12 +387,13 @@ async def launch_background_analysis(plainte_id: int):
     Fonction pour lancer les tâches d'analyse en arrière-plan
     Génère TOUJOURS le PDF de manière synchrone + essaie le worker pour l'analyse IA
     """
+    from ..db.database import get_db
+
+    # Créer une nouvelle session DB pour les tâches background
+    # M5: la session est fermée dans un finally pour éviter toute fuite de
+    # connexion sur exception (saturation du pool après N échecs).
+    db = next(get_db())
     try:
-        from ..db.database import get_db
-        
-        # Créer une nouvelle session DB pour les tâches background
-        db = next(get_db())
-        
         logger.info(f"🚀 Lancement des tâches en arrière-plan pour plainte {plainte_id}")
         
         # Récupérer l'analyse IA
@@ -501,12 +503,14 @@ Le Service Qualité"""
                 
                 db.commit()
                 logger.info(f"✅ Analyse IA simulée terminée pour plainte {plainte_id}: {sentiment}/{priorite_ia}")
-        
-        db.close()
+
         logger.info(f"✅ Tâches en arrière-plan terminées pour plainte {plainte_id}")
-        
+
     except Exception as e:
         logger.error(f"❌ Erreur dans les tâches en arrière-plan pour plainte {plainte_id}: {e}")
+    finally:
+        # M5: fermeture garantie de la session (même en cas d'exception).
+        db.close()
 
 @router.get("/services", response_model=List[dict])
 def get_services_for_assignment(
@@ -589,8 +593,9 @@ async def create_new_complaint(
 
     # Documents optionnels
     documents: List[UploadFile] = File(None),
-    
-    db: Session = Depends(get_db)
+
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     """
     Créer une nouvelle plainte avec tous les détails nécessaires.
@@ -598,7 +603,14 @@ async def create_new_complaint(
     """
     try:
         logger.info(f"🚀 Création d'une nouvelle plainte pour {prenom_plaignant} {nom_plaignant}")
-        
+
+        # C11: rejeter explicitement les champs plaignant vides (sécurité de traçabilité).
+        if not (nom_plaignant and nom_plaignant.strip()) or not (prenom_plaignant and prenom_plaignant.strip()):
+            raise HTTPException(
+                status_code=422,
+                detail="Le nom et le prénom du plaignant sont obligatoires."
+            )
+
         # Validation des IDs
         try:
             service_id = int(service_concerne_id)
@@ -624,33 +636,45 @@ async def create_new_complaint(
         
         # Génération du numéro de plainte (utilise la fonction robuste)
         numero_plainte = generate_numero_plainte(db)
-        
+
+        # C6/M19: répertoire de stockage canonique (chemins absolus résolus).
+        upload_dir = Path("data/documents").resolve()
+
+        # C7/C9/C24: les fichiers sont écrits sur disque AVANT le commit unique ;
+        # leurs chemins sont collectés dans saved_paths pour permettre le
+        # nettoyage disque (rollback) en cas d'échec de la transaction.
+        saved_paths = []
+
         # Traitement des documents - Sauvegarde sur disque
         documents_info = []  # Liste pour stocker les infos des documents
         if documents:
-            upload_dir = "data/documents"
-            os.makedirs(upload_dir, exist_ok=True)
-            
+            upload_dir.mkdir(parents=True, exist_ok=True)
+
             for doc in documents:
                 if doc.filename:
-                    nom_stockage = f"{numero_plainte}_{doc.filename}"
-                    file_path = os.path.join(upload_dir, nom_stockage)
+                    # C6: nom de stockage sécurisé (basename seul, anti path-traversal).
+                    nom_stockage = safe_storage_name(numero_plainte, doc.filename)
+                    file_path = (upload_dir / nom_stockage).resolve()
+                    # C6: vérifier que le chemin final reste dans le périmètre autorisé.
+                    assert_within(upload_dir, file_path)
                     content = await doc.read()
-                    
+
                     with open(file_path, "wb") as buffer:
                         buffer.write(content)
-                    
+                    saved_paths.append(str(file_path))
+
                     # Collecter les infos pour l'enregistrement en DB
                     documents_info.append({
                         "nom_fichier": doc.filename,
                         "nom_stockage": nom_stockage,
-                        "chemin_fichier": file_path,
+                        "chemin_fichier": str(file_path),  # M19: chemin absolu canonique
                         "taille_fichier": len(content),
                         "mime_type": doc.content_type or mimetypes.guess_type(doc.filename)[0],
-                        "type_fichier": get_type_fichier(doc.filename)
+                        "type_fichier": get_type_fichier(doc.filename),
+                        "hash_fichier": file_sha256(file_path)  # M11: empreinte d'intégrité
                     })
                     logger.info(f"📄 Document sauvegardé: {file_path} ({len(content)} octets)")
-        
+
         # Création de la plainte
         new_plainte = Plainte(
             numero_plainte=numero_plainte,
@@ -669,16 +693,19 @@ async def create_new_complaint(
             priorite=PrioritePlainte(priorite),
             statut=StatutPlainte.EN_COURS,
             mode_reception="formulaire",
+            cree_par_id=current_user.id,  # C2/C11: traçabilité du créateur
             date_creation=datetime.now(),
             date_modification=datetime.now()
         )
-        
+
+        # C7/C24: transaction atomique - on ajoute plainte + documents + analyse
+        # puis UN SEUL commit. db.flush() permet d'obtenir new_plainte.id sans
+        # commit intermédiaire.
         db.add(new_plainte)
-        db.commit()
-        db.refresh(new_plainte)
-        
-        logger.info(f"✅ Plainte créée: {new_plainte.numero_plainte} (ID: {new_plainte.id})")
-        
+        db.flush()
+
+        logger.info(f"✅ Plainte préparée: {new_plainte.numero_plainte} (ID: {new_plainte.id})")
+
         # Enregistrement des documents en base de données
         documents_saved = []
         for doc_info in documents_info:
@@ -690,6 +717,7 @@ async def create_new_complaint(
                 type_fichier=doc_info["type_fichier"],
                 taille_fichier=doc_info["taille_fichier"],
                 mime_type=doc_info["mime_type"],
+                hash_fichier=doc_info["hash_fichier"],  # M11
                 est_piece_jointe_originale=True
             )
             db.add(doc_record)
@@ -698,19 +726,22 @@ async def create_new_complaint(
                 "taille": doc_info["taille_fichier"],
                 "type": doc_info["type_fichier"].value
             })
-        
-        if documents_saved:
-            db.commit()
-            logger.info(f"📁 {len(documents_saved)} document(s) enregistré(s) en base pour plainte {new_plainte.id}")
-        
+
         # Création de l'enregistrement d'analyse IA
         analyse_ia = AnalyseIA(
             plainte_id=new_plainte.id,
             statut_analyse="en_attente"
         )
         db.add(analyse_ia)
+
+        # C7/C24: commit unique englobant plainte + documents + analyse.
         db.commit()
-        
+        db.refresh(new_plainte)
+        logger.info(
+            f"✅ Plainte créée: {new_plainte.numero_plainte} (ID: {new_plainte.id}), "
+            f"{len(documents_saved)} document(s) lié(s)"
+        )
+
         # 🚀 RÉPONSE RAPIDE : Lancer les tâches en arrière-plan APRÈS avoir répondu
         background_tasks.add_task(launch_background_analysis, new_plainte.id)
         
@@ -756,10 +787,15 @@ async def create_new_complaint(
         )
         
     except HTTPException:
+        # C7: nettoyage disque même sur erreur de validation après écriture.
+        db.rollback()
+        cleanup_files(locals().get("saved_paths"))
         raise
     except Exception as e:
         logger.error(f"Erreur lors de la création de la plainte: {e}")
         db.rollback()
+        # C7: rollback DB + suppression des fichiers déjà écrits sur disque.
+        cleanup_files(locals().get("saved_paths"))
         raise HTTPException(status_code=500, detail=f"Erreur interne du serveur: {str(e)}")
 
 @router.post("/analyser/{plainte_id}")
@@ -970,11 +1006,12 @@ async def create_complaint_from_validated_data(
     date_incident: Optional[str] = Form(None, description="Date de l'incident (YYYY-MM-DD)"),
     priorite: Optional[str] = Form("MOYEN", description="Priorité de la plainte"),
     assigned_user_id: Optional[int] = Form(None, description="ID de l'utilisateur assigné"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     """
     Créer une nouvelle plainte avec les données VALIDÉES par l'utilisateur.
-    
+
     Cette route est optimisée pour être utilisée APRÈS la prévisualisation.
     Elle ne refait PAS l'analyse IA - elle utilise directement les données validées.
     
@@ -1010,23 +1047,30 @@ async def create_complaint_from_validated_data(
         numero_plainte = generate_numero_plainte(db)
         
         # Sauvegarde du PDF original
-        upload_dir = Path("data/documents/pdf_originaux")
+        # C6/M19: répertoire et chemin canoniques absolus.
+        upload_dir = Path("data/documents/pdf_originaux").resolve()
         upload_dir.mkdir(parents=True, exist_ok=True)
-        
-        nom_stockage = f"{numero_plainte}_{pdf_file.filename}"
-        file_path = upload_dir / nom_stockage
-        
+
+        # C6: nom de stockage sécurisé (basename seul, anti path-traversal).
+        nom_stockage = safe_storage_name(numero_plainte, pdf_file.filename)
+        file_path = (upload_dir / nom_stockage).resolve()
+        assert_within(upload_dir, file_path)
+
+        # C7: collecte des fichiers écrits pour nettoyage disque sur rollback.
+        saved_paths = []
+
         with open(file_path, "wb") as buffer:
             buffer.write(content)
-        
+        saved_paths.append(str(file_path))
+
         logger.info(f"📁 PDF sauvegardé: {file_path} ({len(content)} octets)")
-        
+
         # Conversion de la priorité
         try:
             priorite_enum = PrioritePlainte(priorite) if priorite else PrioritePlainte.MOYEN
         except ValueError:
             priorite_enum = PrioritePlainte.MOYEN
-        
+
         # Conversion de la date d'incident
         date_incident_parsed = None
         if date_incident:
@@ -1034,7 +1078,7 @@ async def create_complaint_from_validated_data(
                 date_incident_parsed = datetime.strptime(date_incident, "%Y-%m-%d").date()
             except ValueError:
                 pass
-        
+
         # Création de la plainte avec les données validées
         new_plainte = Plainte(
             numero_plainte=numero_plainte,
@@ -1049,32 +1093,34 @@ async def create_complaint_from_validated_data(
             priorite=priorite_enum,
             statut=StatutPlainte.RECU,
             date_incident=date_incident_parsed,
+            cree_par_id=current_user.id,  # C2: traçabilité du créateur
             date_creation=datetime.now(),
             date_modification=datetime.now(),
             assignee_a_id=assigned_user_id
         )
-        
+
+        # C7/C24: transaction atomique (plainte + document) avec un seul commit.
         db.add(new_plainte)
-        db.commit()
-        db.refresh(new_plainte)
-        
-        logger.info(f"✅ Plainte créée: {new_plainte.numero_plainte} (ID: {new_plainte.id})")
-        
+        db.flush()
+
         # Enregistrement du document PDF
         doc_record = DocumentPlainte(
             plainte_id=new_plainte.id,
             nom_fichier=pdf_file.filename,
             nom_stockage=nom_stockage,
-            chemin_fichier=str(file_path),
+            chemin_fichier=str(file_path),  # M19: chemin absolu canonique
             type_fichier=TypeFichier.PDF,
             taille_fichier=len(content),
             mime_type="application/pdf",
+            hash_fichier=file_sha256(file_path),  # M11
             description="PDF original de la plainte (document source)",
             est_piece_jointe_originale=True
         )
         db.add(doc_record)
         db.commit()
-        
+        db.refresh(new_plainte)
+
+        logger.info(f"✅ Plainte créée: {new_plainte.numero_plainte} (ID: {new_plainte.id})")
         logger.info(f"📎 Document attaché: {pdf_file.filename}")
         
         # Lancer l'analyse IA en arrière-plan (optionnel)
@@ -1120,12 +1166,15 @@ async def create_complaint_from_validated_data(
         )
         
     except HTTPException:
+        db.rollback()
+        cleanup_files(locals().get("saved_paths"))  # C7
         raise
     except Exception as e:
         logger.error(f"❌ Erreur création plainte depuis données validées: {e}")
         import traceback
         traceback.print_exc()
         db.rollback()
+        cleanup_files(locals().get("saved_paths"))  # C7
         raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
 
 
@@ -1148,7 +1197,8 @@ async def create_complaint_from_image_validated_data(
     date_incident: Optional[str] = Form(None, description="Date de l'incident (YYYY-MM-DD)"),
     priorite: Optional[str] = Form("MOYEN", description="Priorité de la plainte"),
     assigned_user_id: Optional[int] = Form(None, description="ID de l'utilisateur assigné"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     """
     Créer une nouvelle plainte avec les données VALIDÉES par l'utilisateur à partir d'une image.
@@ -1196,23 +1246,30 @@ async def create_complaint_from_image_validated_data(
         numero_plainte = generate_numero_plainte(db)
         
         # Sauvegarde de l'image originale
-        upload_dir = Path("data/documents/images_originales")
+        # C6/M19: répertoire et chemin canoniques absolus.
+        upload_dir = Path("data/documents/images_originales").resolve()
         upload_dir.mkdir(parents=True, exist_ok=True)
-        
-        nom_stockage = f"{numero_plainte}_{image_file.filename}"
-        file_path = upload_dir / nom_stockage
-        
+
+        # C6: nom de stockage sécurisé (basename seul, anti path-traversal).
+        nom_stockage = safe_storage_name(numero_plainte, image_file.filename)
+        file_path = (upload_dir / nom_stockage).resolve()
+        assert_within(upload_dir, file_path)
+
+        # C7: collecte des fichiers écrits pour nettoyage disque sur rollback.
+        saved_paths = []
+
         with open(file_path, "wb") as buffer:
             buffer.write(content)
-        
+        saved_paths.append(str(file_path))
+
         logger.info(f"📁 Image sauvegardée: {file_path} ({len(content)} octets)")
-        
+
         # Conversion de la priorité
         try:
             priorite_enum = PrioritePlainte(priorite) if priorite else PrioritePlainte.MOYEN
         except ValueError:
             priorite_enum = PrioritePlainte.MOYEN
-        
+
         # Conversion de la date d'incident
         date_incident_parsed = None
         if date_incident:
@@ -1220,7 +1277,15 @@ async def create_complaint_from_image_validated_data(
                 date_incident_parsed = datetime.strptime(date_incident, "%Y-%m-%d").date()
             except ValueError:
                 pass
-        
+
+        # Déterminer le type MIME
+        mime_types = {
+            '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+            '.png': 'image/png', '.webp': 'image/webp',
+            '.tiff': 'image/tiff', '.bmp': 'image/bmp', '.gif': 'image/gif'
+        }
+        mime_type = mime_types.get(file_ext, 'image/jpeg')
+
         # Création de la plainte avec les données validées
         new_plainte = Plainte(
             numero_plainte=numero_plainte,
@@ -1235,40 +1300,34 @@ async def create_complaint_from_image_validated_data(
             priorite=priorite_enum,
             statut=StatutPlainte.RECU,
             date_incident=date_incident_parsed,
+            cree_par_id=current_user.id,  # C2: traçabilité du créateur
             date_creation=datetime.now(),
             date_modification=datetime.now(),
             assignee_a_id=assigned_user_id
         )
-        
+
+        # C7/C24: transaction atomique (plainte + document) avec un seul commit.
         db.add(new_plainte)
-        db.commit()
-        db.refresh(new_plainte)
-        
-        logger.info(f"✅ Plainte créée: {new_plainte.numero_plainte} (ID: {new_plainte.id})")
-        
-        # Déterminer le type MIME
-        mime_types = {
-            '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
-            '.png': 'image/png', '.webp': 'image/webp',
-            '.tiff': 'image/tiff', '.bmp': 'image/bmp', '.gif': 'image/gif'
-        }
-        mime_type = mime_types.get(file_ext, 'image/jpeg')
-        
+        db.flush()
+
         # Enregistrement du document Image
         doc_record = DocumentPlainte(
             plainte_id=new_plainte.id,
             nom_fichier=image_file.filename,
             nom_stockage=nom_stockage,
-            chemin_fichier=str(file_path),
+            chemin_fichier=str(file_path),  # M19: chemin absolu canonique
             type_fichier=TypeFichier.IMAGE,
             taille_fichier=len(content),
             mime_type=mime_type,
+            hash_fichier=file_sha256(file_path),  # M11
             description="Image originale de la plainte (document source OCR)",
             est_piece_jointe_originale=True
         )
         db.add(doc_record)
         db.commit()
-        
+        db.refresh(new_plainte)
+
+        logger.info(f"✅ Plainte créée: {new_plainte.numero_plainte} (ID: {new_plainte.id})")
         logger.info(f"📎 Document attaché: {image_file.filename}")
         
         # Lancer l'analyse IA en arrière-plan (optionnel)
@@ -1315,12 +1374,15 @@ async def create_complaint_from_image_validated_data(
         )
         
     except HTTPException:
+        db.rollback()
+        cleanup_files(locals().get("saved_paths"))  # C7
         raise
     except Exception as e:
         logger.error(f"❌ Erreur création plainte depuis image validée: {e}")
         import traceback
         traceback.print_exc()
         db.rollback()
+        cleanup_files(locals().get("saved_paths"))  # C7
         raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
 
 
@@ -1336,7 +1398,8 @@ async def create_complaint_from_pdf(
     prenom_plaignant: Optional[str] = Form(None, description="Prénom du plaignant (modifié par l'utilisateur)"),
     email_plaignant: Optional[str] = Form(None, description="Email du plaignant (modifié par l'utilisateur)"),
     telephone_plaignant: Optional[str] = Form(None, description="Téléphone du plaignant (modifié par l'utilisateur)"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     """
     [DÉPRÉCIÉ - Utiliser /depuis-donnees-validees à la place]
@@ -1373,17 +1436,24 @@ async def create_complaint_from_pdf(
         numero_plainte = generate_numero_plainte(db)
         
         # Sauvegarde du PDF original
-        upload_dir = Path("data/documents/pdf_originaux")
+        # C6/M19: répertoire et chemin canoniques absolus.
+        upload_dir = Path("data/documents/pdf_originaux").resolve()
         upload_dir.mkdir(parents=True, exist_ok=True)
-        
-        nom_stockage = f"{numero_plainte}_{pdf_file.filename}"
-        file_path = upload_dir / nom_stockage
-        
+
+        # C6: nom de stockage sécurisé (basename seul, anti path-traversal).
+        nom_stockage = safe_storage_name(numero_plainte, pdf_file.filename)
+        file_path = (upload_dir / nom_stockage).resolve()
+        assert_within(upload_dir, file_path)
+
+        # C7: collecte des fichiers écrits pour nettoyage disque sur rollback.
+        saved_paths = []
+
         with open(file_path, "wb") as buffer:
             buffer.write(content)
-        
+        saved_paths.append(str(file_path))
+
         logger.info(f"📁 PDF sauvegardé: {file_path} ({len(content)} octets)")
-        
+
         # Extraction du texte du PDF
         extracted_data = None
         extracted_text = ""
@@ -1498,31 +1568,30 @@ async def create_complaint_from_pdf(
             priorite=priorite,
             statut=StatutPlainte.RECU,
             date_incident=date_incident,
+            cree_par_id=current_user.id,  # C2: traçabilité du créateur
             date_creation=datetime.now(),
             date_modification=datetime.now()
         )
-        
+
+        # C7/C24: transaction atomique (plainte + document + analyse) - un seul commit.
         db.add(new_plainte)
-        db.commit()
-        db.refresh(new_plainte)
-        
-        logger.info(f"✅ Plainte créée depuis PDF: {new_plainte.numero_plainte} (ID: {new_plainte.id})")
-        
+        db.flush()
+
         # Enregistrement du document PDF original
         doc_record = DocumentPlainte(
             plainte_id=new_plainte.id,
             nom_fichier=pdf_file.filename,
             nom_stockage=nom_stockage,
-            chemin_fichier=str(file_path),
+            chemin_fichier=str(file_path),  # M19: chemin absolu canonique
             type_fichier=TypeFichier.PDF,
             taille_fichier=len(content),
             mime_type="application/pdf",
+            hash_fichier=file_sha256(file_path),  # M11
             description="PDF original de la plainte (document source)",
             est_piece_jointe_originale=True
         )
         db.add(doc_record)
-        db.commit()
-        
+
         # Création de l'enregistrement d'analyse IA avec les données extraites
         analyse_ia = AnalyseIA(
             plainte_id=new_plainte.id,
@@ -1535,8 +1604,13 @@ async def create_complaint_from_pdf(
             date_analyse=datetime.now()
         )
         db.add(analyse_ia)
+
+        # C7/C24: commit unique englobant plainte + document + analyse.
         db.commit()
-        
+        db.refresh(new_plainte)
+
+        logger.info(f"✅ Plainte créée depuis PDF: {new_plainte.numero_plainte} (ID: {new_plainte.id})")
+
         # Lancer l'analyse complète en arrière-plan
         background_tasks.add_task(launch_background_analysis, new_plainte.id)
         
@@ -1588,12 +1662,15 @@ async def create_complaint_from_pdf(
         )
         
     except HTTPException:
+        db.rollback()
+        cleanup_files(locals().get("saved_paths"))  # C7
         raise
     except Exception as e:
         logger.error(f"❌ Erreur création plainte depuis PDF: {e}")
         import traceback
         traceback.print_exc()
         db.rollback()
+        cleanup_files(locals().get("saved_paths"))  # C7
         raise HTTPException(status_code=500, detail=f"Erreur lors de la création de la plainte depuis le PDF: {str(e)}")
 
 
@@ -2208,7 +2285,8 @@ async def create_complaint_from_image(
     date_incident: Optional[str] = Form(None, description="Date de l'incident"),
     priorite: Optional[str] = Form("MOYEN", description="Priorité de la plainte"),
     assigned_user_id: Optional[int] = Form(None, description="ID de l'utilisateur assigné"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     """
     Créer une nouvelle plainte à partir d'une image (photo de document).
@@ -2249,17 +2327,24 @@ async def create_complaint_from_image(
         numero_plainte = generate_numero_plainte(db)
         
         # Sauvegarde de l'image originale
-        upload_dir = Path("data/documents/images_originales")
+        # C6/M19: répertoire et chemin canoniques absolus.
+        upload_dir = Path("data/documents/images_originales").resolve()
         upload_dir.mkdir(parents=True, exist_ok=True)
-        
-        nom_stockage = f"{numero_plainte}_{image_file.filename}"
-        file_path = upload_dir / nom_stockage
-        
+
+        # C6: nom de stockage sécurisé (basename seul, anti path-traversal).
+        nom_stockage = safe_storage_name(numero_plainte, image_file.filename)
+        file_path = (upload_dir / nom_stockage).resolve()
+        assert_within(upload_dir, file_path)
+
+        # C7: collecte des fichiers écrits pour nettoyage disque sur rollback.
+        saved_paths = []
+
         with open(file_path, "wb") as buffer:
             buffer.write(content)
-        
+        saved_paths.append(str(file_path))
+
         logger.info(f"📁 Image sauvegardée: {file_path} ({len(content)} octets)")
-        
+
         # Extraction du texte via OCR
         extracted_data = None
         extracted_text = ""
@@ -2361,11 +2446,14 @@ async def create_complaint_from_image(
                 )
         
         # Créer la plainte en base
+        # C8: statut=StatutPlainte.RECU (NOUVELLE n'existe pas dans l'enum) ;
+        # suppression des kwargs inexistants source_document/texte_original
+        # (le texte OCR est conservé dans le champ resume_ia de l'AnalyseIA).
         new_plainte = Plainte(
             numero_plainte=numero_plainte,
             titre=final_titre[:200],  # Limiter la longueur
             description=final_description,
-            statut=StatutPlainte.NOUVELLE,
+            statut=StatutPlainte.RECU,
             priorite=PrioritePlainte(final_priorite) if final_priorite in [p.value for p in PrioritePlainte] else PrioritePlainte.MOYEN,
             service_id=service.id,
             mode_reception=final_mode_reception,
@@ -2375,36 +2463,49 @@ async def create_complaint_from_image(
             prenom_plaignant=final_prenom,
             email_plaignant=final_email,
             telephone_plaignant=final_telephone,
-            # Métadonnées
-            source_document=str(file_path),
-            texte_original=extracted_text[:10000] if extracted_text else None,  # Limiter la taille
+            cree_par_id=current_user.id,  # C2: traçabilité du créateur
             assignee_a_id=assigned_user_id
         )
-        
+
+        # C7/C9/C24: transaction atomique (plainte + document) avec un seul
+        # commit. db.flush() fournit l'id sans commit intermédiaire.
         db.add(new_plainte)
+        db.flush()
+
+        # C9: l'enregistrement du document fait partie de la transaction
+        # atomique (plus de try/except silencieux : toute erreur déclenche
+        # le rollback + cleanup disque via le bloc except de l'endpoint).
+        document = DocumentPlainte(
+            plainte_id=new_plainte.id,
+            nom_fichier=image_file.filename,
+            nom_stockage=nom_stockage,
+            chemin_fichier=str(file_path),  # M19: chemin absolu canonique
+            type_fichier=TypeFichier.IMAGE,
+            taille_fichier=len(content),
+            mime_type=f"image/{file_ext.replace('.', '')}",
+            hash_fichier=file_sha256(file_path),  # M11
+            description="Image originale de la plainte (import OCR)",
+            est_piece_jointe_originale=True
+        )
+        db.add(document)
+
+        # C8: conserver le texte OCR extrait dans une AnalyseIA (champ existant)
+        # plutôt que sur des colonnes inexistantes de Plainte.
+        if extracted_text:
+            analyse_ia = AnalyseIA(
+                plainte_id=new_plainte.id,
+                resume_ia=extracted_text[:10000],  # Texte OCR extrait (limité)
+                statut_analyse="en_attente"
+            )
+            db.add(analyse_ia)
+
+        # C7/C9/C24: commit unique englobant plainte + document (+ analyse).
         db.commit()
         db.refresh(new_plainte)
-        
+
         logger.info(f"✅ Plainte créée: {numero_plainte} (ID: {new_plainte.id})")
-        
-        # Créer l'entrée DocumentPlainte pour l'image
-        try:
-            document = DocumentPlainte(
-                plainte_id=new_plainte.id,
-                nom_fichier=image_file.filename,
-                nom_fichier_stockage=nom_stockage,
-                chemin_stockage=str(file_path),
-                type_fichier=TypeFichier.IMAGE,
-                taille_fichier=len(content),
-                mime_type=f"image/{file_ext.replace('.', '')}",
-                description="Image originale de la plainte (import OCR)"
-            )
-            db.add(document)
-            db.commit()
-            logger.info(f"📄 Document image enregistré en BDD")
-        except Exception as doc_error:
-            logger.warning(f"⚠️ Erreur enregistrement document: {doc_error}")
-        
+        logger.info(f"📄 Document image enregistré en BDD")
+
         # Lancer l'analyse complète en arrière-plan
         background_tasks.add_task(launch_background_analysis, new_plainte.id)
         
@@ -2457,12 +2558,15 @@ async def create_complaint_from_image(
         )
         
     except HTTPException:
+        db.rollback()
+        cleanup_files(locals().get("saved_paths"))  # C7/C9
         raise
     except Exception as e:
         logger.error(f"❌ Erreur création plainte depuis image: {e}")
         import traceback
         traceback.print_exc()
         db.rollback()
+        cleanup_files(locals().get("saved_paths"))  # C7/C9
         raise HTTPException(status_code=500, detail=f"Erreur lors de la création de la plainte depuis l'image: {str(e)}")
 
 
@@ -2483,7 +2587,8 @@ async def create_plainte_from_temp_file(
     date_incident: Optional[str] = Form(None, description="Date de l'incident"),
     priorite: Optional[str] = Form("MOYEN", description="Priorité"),
     assigned_user_id: Optional[int] = Form(None, description="ID de l'utilisateur assigné"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     """
     Crée une plainte à partir d'un fichier temporaire déjà uploadé et analysé.
@@ -2592,52 +2697,59 @@ async def create_plainte_from_temp_file(
             prenom_plaignant=prenom_plaignant,
             email_plaignant=email_plaignant,
             telephone_plaignant=telephone_plaignant,
+            cree_par_id=current_user.id,  # C2: traçabilité du créateur
             mode_reception=mode_reception or ("pdf_import" if file_type == "pdf" else "photo_import")
         )
-        
+
+        # C7/C24: transaction atomique. db.flush() pour obtenir l'id sans commit.
         db.add(new_plainte)
         db.flush()
-        
-        # Déterminer le dossier de destination
+
+        # Déterminer le dossier de destination (C6/M19: chemins absolus canoniques).
         if file_type == "image":
-            docs_dir = Path("data/documents/images_originales")
+            docs_dir = Path("data/documents/images_originales").resolve()
         else:
-            docs_dir = Path("data/documents/pdf_originaux")
-        
+            docs_dir = Path("data/documents/pdf_originaux").resolve()
+
         docs_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Nom de fichier final avec numéro de plainte
-        safe_filename = original_filename.replace(" ", "_").replace("/", "_").replace("\\", "_")
-        final_filename = f"{numero_plainte}_{safe_filename}"
-        file_path = docs_dir / final_filename
-        
-        # Déplacer le fichier temp vers le dossier documents
+
+        # C6: nom de fichier final sécurisé (basename seul, anti path-traversal).
+        final_filename = safe_storage_name(numero_plainte, original_filename)
+        file_path = (docs_dir / final_filename).resolve()
+        assert_within(docs_dir, file_path)
+
+        # C7: déplacer le fichier temp vers le dossier documents et collecter
+        # le chemin final pour nettoyage disque sur rollback.
         import shutil
+        saved_paths = []
         shutil.move(str(temp_path), str(file_path))
+        saved_paths.append(str(file_path))
         logger.info(f"📂 Fichier déplacé: {temp_path} → {file_path}")
-        
+
         # Déterminer le type de fichier
         type_fichier = TypeFichier.AUTRE
         if file_type == "pdf":
             type_fichier = TypeFichier.PDF
         elif file_type == "image":
             type_fichier = TypeFichier.IMAGE
-        
+
         # Créer le document associé
         document = DocumentPlainte(
             plainte_id=new_plainte.id,
             nom_fichier=original_filename,
             nom_stockage=final_filename,
-            chemin_fichier=str(file_path),
+            chemin_fichier=str(file_path),  # M19: chemin absolu canonique
             type_fichier=type_fichier,
             taille_fichier=len(content),
+            hash_fichier=file_sha256(file_path),  # M11
             est_piece_jointe_originale=True
         )
-        
+
+        # C7/C24: commit unique englobant plainte + document.
         db.add(document)
         db.commit()
         db.refresh(new_plainte)
-        
+
         logger.info(f"✅ Plainte {numero_plainte} créée depuis fichier temp")
         
         return JSONResponse(content={
@@ -2669,12 +2781,15 @@ async def create_plainte_from_temp_file(
         })
         
     except HTTPException:
+        db.rollback()
+        cleanup_files(locals().get("saved_paths"))  # C7
         raise
     except Exception as e:
         logger.error(f"❌ Erreur création plainte depuis fichier temp: {e}")
         import traceback
         traceback.print_exc()
         db.rollback()
+        cleanup_files(locals().get("saved_paths"))  # C7
         raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
 
 
@@ -2688,7 +2803,8 @@ async def create_plainte_from_archive_file(
     batch_id: str = Form(..., description="ID du batch de traitement"),
     processing_order: int = Form(..., description="Ordre de traitement dans le batch"),
     auto_assign_service: bool = Form(True, description="Assigner automatiquement au service détecté"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     """
     Crée une plainte à partir d'un fichier d'archive de manière ASYNCHRONE.
@@ -2795,7 +2911,8 @@ async def create_plainte_from_archive_file(
                 auto_assign_service=auto_assign_service,
                 task_id=task_id,
                 db=db,
-                background_tasks=background_tasks
+                background_tasks=background_tasks,
+                cree_par_id=current_user.id  # C2: traçabilité du créateur
             )
         
     except HTTPException:
@@ -2818,7 +2935,8 @@ async def _process_archive_file_sync(
     auto_assign_service: bool,
     task_id: str,
     db: Session,
-    background_tasks: BackgroundTasks = None
+    background_tasks: BackgroundTasks = None,
+    cree_par_id: int = None  # C2: id du créateur (transmis depuis l'endpoint authentifié)
 ):
     """
     Traitement synchrone de secours si Celery n'est pas disponible.
@@ -2953,36 +3071,44 @@ async def _process_archive_file_sync(
             prenom_plaignant=prenom_plaignant,
             email_plaignant=email_plaignant,
             telephone_plaignant=telephone_plaignant,
+            cree_par_id=cree_par_id,  # C2: traçabilité du créateur
             mode_reception="archive_import"
         )
-        
+
+        # C7/C24: transaction atomique. db.flush() pour obtenir l'id sans commit.
         db.add(new_plainte)
         db.flush()
-        
-        # Déplacer le fichier
-        docs_dir = Path("data/documents/images_originales" if is_image else "data/documents/pdf_originaux")
+
+        # Déplacer le fichier (C6/M19: dossier et chemin absolus canoniques).
+        docs_dir = Path("data/documents/images_originales" if is_image else "data/documents/pdf_originaux").resolve()
         docs_dir.mkdir(parents=True, exist_ok=True)
-        
-        safe_filename = file.filename.replace(" ", "_").replace("/", "_").replace("\\", "_")
-        final_filename = f"{numero_plainte}_{safe_filename}"
-        file_path = docs_dir / final_filename
-        
+
+        # C6: nom de fichier final sécurisé (basename seul, anti path-traversal).
+        final_filename = safe_storage_name(numero_plainte, file.filename)
+        file_path = (docs_dir / final_filename).resolve()
+        assert_within(docs_dir, file_path)
+
+        # C7: collecte du chemin final pour nettoyage disque sur rollback.
+        saved_paths = []
         shutil.move(str(temp_path), str(file_path))
-        
+        saved_paths.append(str(file_path))
+
         document = DocumentPlainte(
             plainte_id=new_plainte.id,
             nom_fichier=file.filename,
             nom_stockage=final_filename,
-            chemin_fichier=str(file_path),
+            chemin_fichier=str(file_path),  # M19: chemin absolu canonique
             type_fichier=TypeFichier.PDF if is_pdf else TypeFichier.IMAGE,
             taille_fichier=file_size,
+            hash_fichier=file_sha256(file_path),  # M11
             est_piece_jointe_originale=True
         )
-        
+
+        # C7/C24: commit unique englobant plainte + document.
         db.add(document)
         db.commit()
         db.refresh(new_plainte)
-        
+
         logger.info(f"✅ [Archive Sync] Plainte {numero_plainte} créée")
         
         # 🚀 IMPORTANT: Lancer la génération du PDF automatique en arrière-plan
@@ -3021,10 +3147,13 @@ async def _process_archive_file_sync(
         })
         
     except HTTPException:
+        db.rollback()
+        cleanup_files(locals().get("saved_paths"))  # C7
         raise
     except Exception as e:
         logger.error(f"❌ Erreur traitement sync: {e}")
         db.rollback()
+        cleanup_files(locals().get("saved_paths"))  # C7
         raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
 
 
